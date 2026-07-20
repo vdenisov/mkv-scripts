@@ -108,6 +108,42 @@ def extractTrack = { File src, File destFile, String trackType, int trackId ->
     assert (code == 0 || code == 1) : "extractTrack failed (exit $code):\n$out"
 }
 
+/** Build a derivative MKV from test.mkv: choose which tracks survive and
+ *  override names/languages/flags, for the consistency-check tests.
+ *
+ *  opts: audio / subs  -> list of source track IDs to keep, or null to drop the
+ *        whole type; names / langs / defaults -> maps keyed by the OUTPUT track
+ *        id; noChapters, chaptersFile.
+ *
+ *  NOTE mkvmerge renumbers the surviving tracks from 0 in source order, so the
+ *  output IDs are not the source IDs. Assert on the variant's own identify()
+ *  output when the exact id matters. */
+def buildVariant = { File dest, Map opts = [:] ->
+    def cmd = [mkvmergeExe, '--output', dest.absolutePath]
+    if (!opts.containsKey('audio'))   cmd << '--no-audio'
+    else if (opts.audio != null)      cmd.addAll(['--audio-tracks', opts.audio.join(',')])
+    if (!opts.containsKey('subs'))    cmd << '--no-subtitles'
+    else if (opts.subs != null)       cmd.addAll(['--subtitle-tracks', opts.subs.join(',')])
+    if (opts.noChapters)              cmd << '--no-chapters'
+    opts.names?.each    { id, n -> cmd.addAll(['--track-name',        "$id:$n"]) }
+    opts.langs?.each    { id, l -> cmd.addAll(['--language',          "$id:$l"]) }
+    opts.defaults?.each { id, v -> cmd.addAll(['--default-track-flag', "$id:${v ? 'yes' : 'no'}"]) }
+    if (opts.chaptersFile)            cmd.addAll(['--chapters', opts.chaptersFile.absolutePath])
+    cmd << testMkv.absolutePath
+    def (code, out) = exec(cmd)
+    assert (code == 0 || code == 1) : "buildVariant failed (exit $code):\n$out"
+    dest
+}
+
+/** Write a minimal OGM-simple chapter file; mkvmerge reads it as text, so the
+ *  chapter tests need no binary fixture. */
+def writeChapters = { File workDir ->
+    def f = new File(workDir, 'chapters.txt')
+    f.text = "CHAPTER01=00:00:00.000\nCHAPTER01NAME=Intro\n" +
+             "CHAPTER02=00:00:02.000\nCHAPTER02NAME=Main\n"
+    f
+}
+
 /** Write config.yaml into workDir (mkv.groovy reads it from the CWD). */
 def writeConfig = { File workDir, String yaml ->
     new File(workDir, 'config.yaml').text = yaml
@@ -1374,6 +1410,337 @@ runTest('58_to_utf8_utf16_left_alone') { workDir ->
     checkEquals(code, 0, 'exit code')
     check(out.contains('UTF-16'), 'says it recognised UTF-16')
     checkEquals(f.bytes.toList(), bytes.toList(), 'left exactly as it was')
+}
+
+// ─── Consistency check (--check) ─────────────────────────────────────────────
+// Fixtures are synthesised from test.mkv with buildVariant. Keeping all seven
+// tracks preserves the source IDs 0-6, so name/flag splits land on a known ID;
+// dropping a track produces a genuine absence at that ID.
+
+/** A full 7-track copy of test.mkv with optional per-id overrides. */
+def fullCopy = { File dest, Map overrides = [:] ->
+    buildVariant(dest, [audio: [1, 2, 3], subs: [4, 5, 6]] + overrides)
+}
+
+/** config selecting audio 1,2 and subtitle 6 — the IDs the split tests touch. */
+def checkCfg = {
+    cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true],
+                      [id: 2, language: 'ru', title: 'Russian',  default: false]],
+        subtitleTracks: [[id: 6, language: 'ja', title: 'Signs', default: false]])
+}
+
+// ─── 59. a clean batch reports consistent, with no minority markers ──────────
+runTest('59_check_clean_batch') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('consistent across all 2 file(s)'), 'reports consistent')
+    check(!out.contains('<-'), 'no minority markers on a clean batch')
+    check(!new File(workDir, 'mkv').exists(), '--check muxes nothing')
+}
+
+// ─── 60. a track-name split is grouped, minority named, majority not ─────────
+runTest('60_check_name_split_grouping') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    // The minority (one file) is named after a <- marker; the majority is not
+    def arrowLines = out.readLines().findAll { it.contains('<-') }
+    check(arrowLines.any { it.contains('odd.mkv') }, 'minority file named')
+    check(!arrowLines.any { it.contains('S01E01.mkv') || it.contains('S01E02.mkv') },
+          'majority files not named as deviant')
+    check(out.contains('config title "Russian"'), 'blocking label names the config title')
+}
+
+// ─── 61. grouping anchors on the majority, not the first file ────────────────
+// The odd file sorts first alphabetically. First-file anchoring would flag the
+// three normal files against it; majority anchoring flags the one odd file.
+runTest('61_check_never_anchors_on_first_file') { workDir ->
+    fullCopy(new File(workDir, 'a_odd.mkv'), [names: [2: 'Other Studio']])
+    fullCopy(new File(workDir, 'b.mkv'))
+    fullCopy(new File(workDir, 'c.mkv'))
+    fullCopy(new File(workDir, 'd.mkv'))
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    // Tokenise the flagged names — a substring test would trip on "a_odd.mkv"
+    // containing "d.mkv"
+    def flagged = out.readLines().findAll { it.contains('<-') }
+                     .collectMany { (it =~ /[\w.]+\.mkv/).collect { m -> m } } as Set
+    check('a_odd.mkv' in flagged, 'the odd file is flagged')
+    check(!(['b.mkv', 'c.mkv', 'd.mkv'].any { it in flagged }),
+          'the three matching files are not flagged despite one sorting after the odd one')
+}
+
+// ─── 62. a file missing a track is a layout outlier, not a per-ID absence ────
+// A dropped track changes the file's overall layout, so it is hoisted into the
+// "different track layout" section rather than smeared across the per-ID table.
+runTest('62_check_missing_track_is_layout_outlier') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    buildVariant(new File(workDir, 'nosub.mkv'), [audio: [1, 2, 3], subs: [4, 5]])  // no track 6
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('different track layout'), 'reports a layout difference')
+    check(out.readLines().findAll { it.contains('<-') }.any { it.contains('nosub.mkv') },
+          'names the file with the different layout')
+    check(out.contains('selected track 6'), 'blocking label names the missing selected track')
+}
+
+// ─── 63. a per-file video title difference produces no discrepancy ───────────
+runTest('63_check_video_title_ignored') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'), [names: [0: 'Episode One']])
+    fullCopy(new File(workDir, 'S01E02.mkv'), [names: [0: 'Episode Two']])
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('consistent'), 'video title differences are ignored')
+}
+
+// ─── 64. chapters present in some files and not others is detected ───────────
+runTest('64_check_chapters_split') { workDir ->
+    fullCopy(new File(workDir, 'withchap.mkv'), [chaptersFile: writeChapters(workDir)])
+    fullCopy(new File(workDir, 'nochap.mkv'))
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Chapters: present in 1 file(s), absent in 1'), 'reports the chapter split')
+    // Chapters are always informational, never blocking
+    check(out.contains('informational'), 'chapters land under informational')
+}
+
+// ─── 65. two indistinguishable same-language tracks are flagged ──────────────
+runTest('65_check_ambiguous_duplicate') { workDir ->
+    // Two audio tracks, both eng AAC with no name: build from two sources. The
+    // track-name targets source id 2, which is the audio track being kept.
+    def dest = new File(workDir, 'amb.mkv')
+    def (c, o) = exec([mkvmergeExe, '--output', dest.absolutePath,
+                       '--no-subtitles', '--audio-tracks', '2', '--track-name', '2:', testMkv.absolutePath,
+                       '--no-video', '--no-subtitles', '--audio-tracks', '2', '--track-name', '2:', testMkv.absolutePath])
+    assert (c == 0 || c == 1) : "build failed:\n$o"
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'en', title: 'English', default: true]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Ambiguous track IDs'), 'reports the ambiguity')
+    check(out.contains('cannot distinguish'), 'explains why it matters')
+}
+
+// ─── 66. a name on one of the pair removes the ambiguity ─────────────────────
+// The false-positive guard: type+language+codec+name must ALL match.
+runTest('66_check_named_duplicate_not_flagged') { workDir ->
+    def dest = new File(workDir, 'named.mkv')
+    def (c, o) = exec([mkvmergeExe, '--output', dest.absolutePath,
+                       '--no-subtitles', '--audio-tracks', '2', '--track-name', '2:', testMkv.absolutePath,
+                       '--no-video', '--no-subtitles', '--audio-tracks', '2', '--track-name', '2:Commentary', testMkv.absolutePath])
+    assert (c == 0 || c == 1) : "build failed:\n$o"
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'en', title: 'English', default: true]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(!out.contains('Ambiguous track IDs'), 'a distinguishing name suppresses the flag')
+}
+
+// ─── 67. a discrepancy on a selected track is blocking ───────────────────────
+runTest('67_check_blocking_when_selected') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    // config selects track 2, and not all audio is copied (3 is left out)
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true],
+                                           [id: 2, language: 'ru', title: 'Russian',  default: false]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('affect tracks that config.yaml selects') ||
+          out.contains('affects a track that config.yaml selects'), 'classified blocking')
+    check(out.contains('track 2'), 'names the selected track')
+}
+
+// ─── 68. the same discrepancy on an unselected track is informational ────────
+runTest('68_check_informational_when_unselected') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    // config selects only track 1, so a split on track 2 cannot mis-select
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('informational'), 'classified informational')
+    check(!out.contains('affect tracks that config.yaml selects') &&
+          !out.contains('affects a track that config.yaml selects'), 'no blocking section')
+}
+
+// ─── 69. informational when all tracks of the type are copied ────────────────
+// A split on track 2 cannot mis-select when audio 1,2,3 are ALL selected: IDs
+// cannot point at the wrong track if every track is being taken.
+runTest('69_check_informational_when_all_copied') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true],
+                                           [id: 2, language: 'ru', title: 'Russian',  default: false],
+                                           [id: 3, language: 'ru', title: 'Russian 2', default: false]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('informational'), 'classified informational when the whole type is copied')
+}
+
+// ─── 70. --strict aborts on a blocking discrepancy ───────────────────────────
+runTest('70_check_strict_aborts_on_blocking') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true],
+                                           [id: 2, language: 'ru', title: 'Russian',  default: false]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--strict'])
+    checkEquals(code, 2, 'exits 2 on a blocking discrepancy under --strict')
+    check(out.contains('aborting'), 'says it aborted')
+    check(!new File(workDir, 'mkv').exists(), 'nothing muxed, no output dir')
+}
+
+// ─── 71. --strict continues when findings are only informational ─────────────
+runTest('71_check_strict_continues_on_informational') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--strict'])
+    checkEquals(code, 0, 'informational findings do not abort under --strict')
+    checkEquals(outputNames(workDir), ['S01E01.mkv', 'S01E02.mkv', 'odd.mkv'], 'all three muxed')
+}
+
+// ─── 72. --no-check suppresses the report and still muxes ────────────────────
+runTest('72_check_no_check_suppresses') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true],
+                                           [id: 2, language: 'ru', title: 'Russian',  default: false]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--no-check'])
+    checkEquals(code, 0, 'exit code')
+    check(!out.contains('Pre-flight'), 'no report printed')
+    checkEquals(outputNames(workDir), ['S01E01.mkv', 'odd.mkv'], 'both still muxed')
+}
+
+// ─── 73. the default run checks first, then muxes ────────────────────────────
+runTest('73_check_runs_by_default') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    fullCopy(new File(workDir, 'S01E02.mkv'))
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Pre-flight'), 'the check runs without being asked')
+    check(out.indexOf('Pre-flight') < out.indexOf('Processing'), 'check comes before muxing')
+    checkEquals(outputNames(workDir), ['S01E01.mkv', 'S01E02.mkv'], 'files still muxed')
+}
+
+// ─── 74. --identify and --check combined print both, mux nothing, probe once ─
+runTest('74_check_and_identify_combined') { workDir ->
+    fullCopy(new File(workDir, 'S01E01.mkv'))
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--identify', '--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Pre-flight'), 'cross-file report present')
+    check(out.contains('*** S01E01.mkv'), 'per-file identify table present')
+    check(!new File(workDir, 'mkv').exists(), 'combined mode muxes nothing')
+}
+
+// ─── 75. an unidentifiable file is excluded, not crashed on ──────────────────
+runTest('75_check_survives_unidentifiable_file') { workDir ->
+    fullCopy(new File(workDir, 'good.mkv'))
+    new File(workDir, 'broken.mkv').bytes = new byte[2048]   // zero bytes: not a media file
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('could not be identified'), 'reports the bad file')
+    check(out.contains('broken.mkv'), 'names it')
+    check(!out.contains('Exception'), 'no stack trace')
+}
+
+// ─── 76. an even split names every file, since neither group is the reference ─
+runTest('76_check_even_split_names_all') { workDir ->
+    fullCopy(new File(workDir, 'a.mkv'))
+    fullCopy(new File(workDir, 'b.mkv'))
+    fullCopy(new File(workDir, 'c.mkv'), [names: [2: 'Other']])
+    fullCopy(new File(workDir, 'd.mkv'), [names: [2: 'Other']])
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    // With no strict majority there is no unnamed reference row, so both value
+    // groups list their files. Scan the whole report for names, not just the
+    // "<-" lines: with one name per line, only the first of each list has the
+    // arrow. Safe here because no track name in this fixture ends in .mkv.
+    def flagged = (out =~ /[\w.]+\.mkv/).collect { it } as Set
+    check(['a.mkv', 'b.mkv', 'c.mkv', 'd.mkv'].every { it in flagged },
+          'every file is named when the split is even')
+}
+
+// ─── 77. structurally different files are grouped by layout, not scattered ───
+// The Blindspot case: some episodes have the subtitle track first (a different
+// track order), so a per-ID comparison would show the same files at three
+// different IDs. They must instead be collected into one "different layout"
+// group, leaving the common-layout files to compare cleanly.
+runTest('77_check_layout_grouping') { workDir ->
+    // Common 3-track layout: video, audio, subs
+    ['a.mkv', 'b.mkv', 'c.mkv'].each { buildVariant(new File(workDir, it), [audio: [1], subs: [4]]) }
+    // The same three tracks with the subtitle first — a pure track-order shift
+    ['x.mkv', 'y.mkv'].each { name ->
+        def (cc, oo) = exec([mkvmergeExe, '--output', new File(workDir, name).absolutePath,
+                             '--audio-tracks', '1', '--subtitle-tracks', '4',
+                             '--track-order', '0:4,0:0,0:1', testMkv.absolutePath])
+        assert (cc == 0 || cc == 1) : "build failed:\n$oo"
+    }
+    writeConfig(workDir, cfg(audioTracks:    [[id: 1, language: 'ja', title: 'Japanese', default: true]],
+                             subtitleTracks: [[id: 2, language: 'ja', title: 'Signs',    default: false]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('different track layout'), 'shifted files reported as a layout group')
+
+    def flagged = (out =~ /[\w.]+\.mkv/).collect { it } as Set
+    check('x.mkv' in flagged && 'y.mkv' in flagged, 'both shifted files named in the layout group')
+    check(!(['a.mkv', 'b.mkv', 'c.mkv'].any { it in flagged }), 'common-layout files not flagged')
+    check(out.contains('Layout 1 (3 files)'), 'the three common-layout files are the largest group')
+    check(out.contains('Layout 2 (2 files)'), 'the two shifted files are their own layout group')
+    // The shift lands audio/subs on IDs the config selects, so it must block
+    check(out.contains('a different track layout, at selected track'), 'shift classified as blocking')
+}
+
+// ─── 78. --check-verbose implies --check and muxes nothing ───────────────────
+// It is a modifier on the report, not "mux with a verbose pre-flight" — a bare
+// --check-verbose used to fall through and mux the whole batch.
+runTest('78_check_verbose_does_not_mux') { workDir ->
+    fullCopy(new File(workDir, 'a.mkv'))
+    fullCopy(new File(workDir, 'b.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check-verbose'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Pre-flight'), 'the report is printed')
+    check(!out.contains('Processing'), 'nothing is muxed')
+    check(!new File(workDir, 'mkv').exists(), 'no output directory created')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────

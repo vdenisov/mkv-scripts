@@ -103,7 +103,7 @@ root:
 
 | Script | Purpose |
 |--------|---------|
-| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--dry-run` prints commands without running them, and file names or globs (plus `--exclude`) narrow the batch. |
+| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--check` compares track structure across the batch, `--dry-run` prints commands without running them, and file names or globs (plus `--exclude`) narrow the batch. |
 | `fetch_episodes.groovy` | Fetches episode names for a show/season from TheMovieDB and writes `episodes.txt`. |
 | `rename.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
@@ -158,8 +158,9 @@ be untangled by hand.
 ### mux.groovy
 
 ```
-groovy src/mux.groovy                          # mux every matching file
+groovy src/mux.groovy                          # check, then mux every matching file
 groovy src/mux.groovy --identify               # list tracks per file, mux nothing
+groovy src/mux.groovy --check                  # compare tracks across files, mux nothing
 groovy src/mux.groovy --dry-run                # print the mkvmerge command per file, run nothing
 groovy src/mux.groovy "Show.S01E0[12].mkv"     # only the files matching a pattern
 groovy src/mux.groovy --exclude "*.sample.mkv" # everything except the files matching a pattern
@@ -211,6 +212,83 @@ the gaps are visible before the first mux and the complete episodes still get
 processed. Those episodes would have failed anyway, so nothing is lost by
 skipping them — this never aborts the run. If every episode is blocked, the run
 says so instead of printing a bare `Done`.
+
+#### Consistency check
+
+`config.yaml` selects tracks by **numeric ID**, which quietly assumes every
+episode in the directory has the same track layout. When that breaks — a
+translation added mid-season, an old one dropped, a different release group
+ordering tracks differently — mkvmerge does not complain; it muxes whatever sits
+at that ID, and you discover the wrong dub at playback time.
+
+The consistency check compares track structure across the whole batch and reports
+it before muxing. It runs automatically (skip it with `--no-check`), or on its own
+with `--check`, which muxes nothing. `--check` and `--identify` can be combined —
+they answer different questions and share one `mkvmerge` scan.
+
+It works in two layers. First it groups files by **track layout** — the type at
+each ID. Files that share a layout are the same release and get one table; files
+whose layout differs (a different track order, or a track missing) are a different
+release and get their own, largest group first. This keeps a shifted-track-order
+release from being smeared across the per-ID table, where the same file would
+otherwise appear at every shifted ID. Then, within each group, it compares the
+**values** at each ID — codec, language, name, default/forced flags — stacking a
+row per distinct value and naming the files that carry it:
+
+```
+*** Layout 1 (20 files): video, audio, subs
+    ID   TYPE   CODEC                LANG  DEF  FOR  NAME
+    0    video  AVC/H.264/MPEG-4p10  eng   yes  no   -
+    1    audio  AC-3                 eng   yes  no   (no name)
+    2    subs   SubRip/SRT           eng   yes  no   English (SDH)
+           <- Show.S01E16 - Any Wounded Thief.mkv
+    2    subs   SubRip/SRT           eng   no   no   English (SDH)
+
+*** Layout 2 (2 files): subs, video, audio
+           <- Show.S01E18 - One Begets Technique.mkv
+              Show.S01E20 - Swift Hardhearted Stone.mkv
+    ID   TYPE   CODEC                LANG  DEF  FOR  NAME
+    0    subs   SubRip/SRT           eng   yes  no   (no name)
+    1    video  AVC/H.264/MPEG-4p10  eng   yes  no   -
+    2    audio  AC-3                 eng   yes  no   English (SDH)
+
+*** 1 discrepancy affects a track that config.yaml selects:
+      2 files use a different track layout, at selected tracks 0, 1, 2
+*** 1 informational (does not affect what gets muxed):
+      track 2 (subtitles, config title "Signs") - default differs across 2 groups
+```
+
+How to read it:
+
+- **Structural groups, largest first.** Files with a different track order or a
+  missing track form their own group, listed once — not once per shifted ID.
+- **One row per distinct value, not per file** — a 200-episode batch is as compact
+  as a 3-episode one. Every track is listed, so the table doubles as the map you
+  check `config.yaml`'s IDs against. The `DEF`/`FOR` columns make a flag-only
+  difference legible, and on a terminal the differing cell is highlighted.
+- **The `<-` names the files that deviate**, one per line. In the common group the
+  majority row is the unnamed reference and only the minorities are named — the
+  tool never assumes the first file is the reference, so a translation dropped from
+  episode 9 on flags those files, not the majority. An even split names both sides;
+  an outlier group names all of its files.
+- **Blocking vs informational.** A difference only corrupts output when it lands on
+  a track the config selects by ID *and* not every track of that type is being
+  copied. Everything else — unselected tracks, chapters, a type copied wholesale —
+  is reported as informational.
+
+What is compared: per layout, the type at each ID; then per ID, codec, language,
+name and default/forced flags, plus chapter presence and genuinely ambiguous
+same-language duplicates (two tracks that match on type, language, codec *and*
+name, where ID selection cannot tell them apart). What is ignored: the video
+track's title, which carries the episode name and differs by design, along with
+duration, file size and muxing metadata.
+
+By default the check **warns and continues** — muxing the wrong tracks is
+recoverable, the source files survive. Pass `--strict` to abort (exit 2) when any
+discrepancy affects a selected track. File lists are truncated to a few names;
+`--check-verbose` prints them in full (and, like `--check`, muxes nothing).
+Highlighting follows `--color` (`auto` by default: on at a terminal, off when
+redirected).
 
 `--identify` prints the track table you need in order to write the config — id,
 type, codec, language, default/forced flags and track name for every track of
