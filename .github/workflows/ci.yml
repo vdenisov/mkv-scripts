@@ -31,9 +31,9 @@ jobs:
             mkvtoolnix: upstream
     name: Groovy ${{ matrix.groovy }} / JDK ${{ matrix.java }} / mkvtoolnix ${{ matrix.mkvtoolnix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
@@ -50,7 +50,7 @@ jobs:
           mkvmerge --version
 
       - name: Cache Groovy distribution
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/groovy
           key: groovy-${{ matrix.groovy }}
@@ -65,7 +65,7 @@ jobs:
           echo "$HOME/groovy/groovy-${{ matrix.groovy }}/bin" >> "$GITHUB_PATH"
 
       - name: Cache Grapes
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.groovy/grapes
           key: grapes-${{ matrix.groovy }}-${{ hashFiles('src/**/*.groovy') }}

@@ -26,7 +26,8 @@ import groovy.json.JsonSlurper
 def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
 def repoRoot  = scriptDir.parentFile.parentFile          // …/mkv-script
 def testMkv   = new File(scriptDir, 'test.mkv')
-def mkvgroovy = new File(repoRoot, 'src/mkv.groovy')
+def mkvgroovy = new File(repoRoot, 'src/mux.groovy')
+def binDir    = new File(repoRoot, 'bin')
 def workRoot  = new File(scriptDir, 'work')
 
 def isWindows = System.getProperty('os.name').toLowerCase().contains('win')
@@ -51,7 +52,7 @@ def findMkvTool = { String name ->
 def mkvmergeExe = mkvmergeExeOverride ?: findMkvTool('mkvmerge')
 
 assert testMkv.exists()   : "test.mkv not found at $testMkv"
-assert mkvgroovy.exists() : "mkv.groovy not found at $mkvgroovy"
+assert mkvgroovy.exists() : "mux.groovy not found at $mkvgroovy"
 
 // ─── Helpers (closures so they capture script-scope variables) ───────────────
 
@@ -635,6 +636,74 @@ runTest('24_realistic_season_episode') { workDir ->
 
     def langs = tracks.collect { it.get('properties').language }
     check(!langs.contains('rus'), 'no Russian tracks in output')
+}
+
+// ─── 25. bin/ wrappers exist and point at real scripts ───────────────────────
+// 16 hand-written files; this catches typos for the price of a directory listing.
+runTest('25_wrappers_exist_and_resolve') { workDir ->
+    def wrappers = [
+        'mkv-mux'                : 'mux.groovy',
+        'mkv-rename'             : 'rename.groovy',
+        'mkv-propedit'           : 'propedit.groovy',
+        'mkv-fix-srt'            : 'fix_srt.groovy',
+        'mkv-fetch-episodes'     : 'fetch_episodes.groovy',
+        'mkv-filename-to-title'  : 'filename_to_title.groovy',
+        'mkv-to-utf8'            : 'to_utf8.groovy',
+        'mkv-find-unused-fonts'  : 'find_unused_fonts.groovy',
+    ]
+
+    wrappers.each { name, target ->
+        def sh  = new File(binDir, name)
+        def bat = new File(binDir, "${name}.bat")
+
+        check(sh.exists(),  "$name exists")
+        check(bat.exists(), "${name}.bat exists")
+        check(sh.length()  > 0, "$name is not empty")
+        check(bat.length() > 0, "${name}.bat is not empty")
+
+        // Both wrappers must name the same script, and it must be a real file
+        check(sh.text.contains("../src/${target}"),  "$name references src/$target")
+        check(bat.text.contains("..\\src\\${target}"), "${name}.bat references src\\$target")
+        check(new File(repoRoot, "src/${target}").exists(), "src/$target exists (referenced by $name)")
+    }
+}
+
+// ─── 26. Wrapper actually runs ────────────────────────────────────────────────
+// Bare invocation in a directory with a config but no media files: the script
+// should start up, find nothing to do, and exit cleanly. Deliberately avoids
+// any CLI flags so this test does not depend on later features.
+runTest('26_wrapper_smoke') { workDir ->
+    // The wrappers hardcode a bare 'groovy'; the harness may be using groovy.home.
+    // On Windows 'groovy' is a .bat, which ProcessBuilder cannot launch directly —
+    // probe through cmd, the same way the wrapper itself is invoked below.
+    def groovyOnPath = { ->
+        try {
+            def probe = isWindows ? ['cmd', '/c', 'groovy', '--version'] : ['groovy', '--version']
+            def p = probe.execute()
+            p.waitFor()
+            return p.exitValue() == 0
+        } catch (ignored) {
+            return false
+        }
+    }()
+
+    if (!groovyOnPath) {
+        println "  (skipped: 'groovy' is not on PATH; wrappers require it)"
+        return
+    }
+
+    writeConfig(workDir, cfg(
+        audioTracks: [[id: 2, language: 'en', title: 'English', default: true]],
+        trackOrder: '0:0,0:2'
+    ))
+
+    def cmd = isWindows
+        ? ['cmd', '/c', new File(binDir, 'mkv-mux.bat').absolutePath]
+        : [new File(binDir, 'mkv-mux').absolutePath]
+
+    def (code, out) = exec(cmd, workDir)
+    checkEquals(code, 0, 'wrapper exit code')
+    check(out.contains('*** Done'), 'wrapper ran mux.groovy to completion')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
