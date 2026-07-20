@@ -12,6 +12,8 @@ All scripts operate on the current working directory — in practice the directo
 
 ```bash
 groovy src/mux.groovy                                       # Main muxer — reads config.yaml (CWD, then script dir)
+groovy src/mux.groovy --identify                            # Print a track table per file, mux nothing
+groovy src/mux.groovy --dry-run                             # Print the mkvmerge command per file, run nothing
 groovy src/fetch_episodes.groovy --show-id 2260 --season 1  # Fetch episode names from TheMovieDB
 groovy src/rename.groovy "Show Name" [episodeOffset]        # Batch-rename files
 groovy src/filename_to_title.groovy                         # Set MKV segment title/track name from filename
@@ -65,6 +67,10 @@ TheMovieDB API
 `mux.groovy` is the core script. It reads `config.yaml` (CWD first, then the script's own directory), discovers all files in the current directory matching `allowedExtensions`, and for each file constructs and executes an `mkvmerge` command.
 
 **Critical pattern:** all helpers in `mux.groovy` must be closures (`def foo = { ... }`), not methods (`def foo() { ... }`). Groovy methods on a Script class cannot access `def`-declared local variables from the script body — closures can because they capture their enclosing scope. `buildCommandLine` is defined as a closure for this reason.
+
+The script uses picocli via `@PicocliScript2` (like `rename.groovy` and `fetch_episodes.groovy`). Annotations and `@Field` declarations must all precede the first script-body statement; the closure pattern above still applies to everything after them. This combination is verified on both Groovy 3/JDK 11 and Groovy 5/JDK 21 — `@GrabConfig(systemClassLoader = true)` now covers snakeyaml as well, which is the part most likely to break on a JDK change.
+
+**The `properties` trap:** when reading `mkvmerge -J` output, the per-track JSON key `properties` must be accessed as `track.get('properties')`. On Groovy 4+ both `track.properties` and `track['properties']` resolve to the bean properties of the map object itself, silently returning the wrong thing. This applies to `identifyFile` in `mux.groovy` as well as the test harness.
 
 Lazy GString closures (`${-> fileName}`) are used throughout `buildCommandLine` so that `fileName` and `extension` are evaluated at command execution time, not at closure definition time.
 

@@ -97,7 +97,7 @@ root:
 
 | Script | Purpose |
 |--------|---------|
-| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. |
+| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--dry-run` prints commands without running them. |
 | `fetch_episodes.groovy` | Fetches episode names for a show/season from TheMovieDB and writes `episodes.txt`. |
 | `rename.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
@@ -132,7 +132,9 @@ number.
 ### mux.groovy
 
 ```
-groovy src/mux.groovy
+groovy src/mux.groovy              # mux every matching file
+groovy src/mux.groovy --identify   # list tracks per file, mux nothing
+groovy src/mux.groovy --dry-run    # print the mkvmerge command per file, run nothing
 ```
 
 Reads `config.yaml` (current directory first, then the copy next to the
@@ -141,11 +143,26 @@ script), discovers all files in the current directory matching
 `destinationDir`. If a file fails, the error is printed and processing continues
 with the next file. See [Configuration](#configuration) below.
 
-To discover track IDs in a source file first:
+`--identify` prints the track table you need in order to write the config — id,
+type, codec, language, default/forced flags and track name for every track of
+every matching file:
 
 ```
-mkvmerge -i episode.mkv
+*** Show.S01E01.mkv
+  ID   TYPE       CODEC                  LANG  DEF  FOR  NAME
+  0    video      AVC/H.264/MPEG-4p10    und   no   no   Video
+  1    audio      AAC                    jpn   yes  no   Audio A
+  2    audio      AAC                    eng   no   no   Audio B
+  4    subtitles  SubRip/SRT             eng   yes  no   Subtitle A
 ```
+
+`--dry-run` prints the exact command that would be run, which is the quickest
+way to check track selection and `${fileName}` companion resolution before
+committing to a long mux. Both flags leave the filesystem untouched — not even
+`destinationDir` is created.
+
+The printed command is meant for reading, not for pasting: mkvmerge's `(` and
+`)` source-grouping tokens are not shell-safe as written.
 
 ### Post-processing utilities
 

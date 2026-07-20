@@ -109,10 +109,10 @@ def stageInput = { File workDir, String name = 'test.mkv' ->
     dest
 }
 
-/** Run mkv.groovy from workDir; return [exitCode, output].
+/** Run mux.groovy from workDir; return [exitCode, output].
  *  The output is also kept for diagnostics if the test fails. */
-def runMkvGroovy = { File workDir ->
-    def result = exec([groovyExe, mkvgroovy.absolutePath], workDir)
+def runMkvGroovy = { File workDir, List extraArgs = [] ->
+    def result = exec([groovyExe, mkvgroovy.absolutePath] + extraArgs, workDir)
     lastMkvOutput = result[1]
     result
 }
@@ -704,6 +704,40 @@ runTest('26_wrapper_smoke') { workDir ->
     def (code, out) = exec(cmd, workDir)
     checkEquals(code, 0, 'wrapper exit code')
     check(out.contains('*** Done'), 'wrapper ran mux.groovy to completion')
+}
+
+// ─── 27. --dry-run prints the command and touches nothing ────────────────────
+runTest('27_dry_run_produces_no_output') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id: 2, language: 'en', title: 'English', default: true]],
+        trackOrder: '0:0,0:2'
+    ))
+
+    def (code, out) = runMkvGroovy(workDir, ['--dry-run'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Dry run'), 'announces dry run')
+    check(out.contains('--track-order'), 'prints the built command line')
+
+    // Nothing may be written — not even the destination directory
+    check(!new File(workDir, 'mkv').exists(), 'destination dir not created')
+}
+
+// ─── 28. --identify lists tracks without muxing ──────────────────────────────
+// Assertions are deliberately loose: column formatting is expected to drift.
+runTest('28_identify_lists_tracks') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id: 2, language: 'en', title: 'English', default: true]],
+        trackOrder: '0:0,0:2'
+    ))
+
+    def (code, out) = runMkvGroovy(workDir, ['--identify'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('video'),     'lists the video track')
+    check(out.contains('subtitles'), 'lists subtitle tracks')
+    check(out.contains('jpn'),       'lists track languages')
+    check(!new File(workDir, 'mkv').exists(), 'destination dir not created')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────

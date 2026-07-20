@@ -1,7 +1,25 @@
-@Grab('commons-io:commons-io:2.11.0')
-@Grab('org.yaml:snakeyaml:1.30')
+import groovy.json.JsonSlurper
+import groovy.transform.Field
 import org.apache.commons.io.FilenameUtils
 import org.yaml.snakeyaml.Yaml
+import picocli.CommandLine
+import picocli.groovy.PicocliScript2
+
+@Grab('commons-io:commons-io:2.11.0')
+@Grab('org.yaml:snakeyaml:1.30')
+@Grab('info.picocli:picocli-groovy:4.6.3')
+@GrabConfig(systemClassLoader = true)
+@CommandLine.Command(name = "mkv-mux", mixinStandardHelpOptions = true,
+                     description = "Mux MKV files from multiple sources using mkvmerge.")
+@PicocliScript2
+
+@CommandLine.Option(names = ["--identify"],
+                    description = "Print a track table for every matching file and exit without muxing")
+@Field boolean identifyOnly = false
+
+@CommandLine.Option(names = ["-n", "--dry-run"],
+                    description = "Print the mkvmerge command line for every matching file without executing it")
+@Field boolean dryRun = false
 
 // Load configuration from YAML file: the current directory takes precedence
 // (per-show config next to the media files), falling back to the config
@@ -29,9 +47,6 @@ def findMkvTool = { String name ->
 
 // Extract general settings from config
 def destinationDir = config.general.destinationDir
-// mkvmerge only creates a missing output directory in recent versions (older
-// ones fail to open the output file), so create it here
-new File(destinationDir).mkdirs()
 def allowedExtensions = config.general.allowedExtensions as Set
 def mkvmergeExe = (config.general.containsKey('mkvmergeExe') && config.general.mkvmergeExe)
     ? config.general.mkvmergeExe
@@ -51,6 +66,48 @@ def uiLanguage = ["en", "en_US"].find { lang ->
     }
 }
 def priority = "lower"
+
+// Print a readable track table for one file, for --identify.
+//
+// NOTE: the per-track JSON key "properties" must be read with .get('properties').
+// On Groovy 4+ both track.properties and track['properties'] resolve to the bean
+// properties of the map object itself, not the JSON key of that name.
+def identifyFile = { File file ->
+    println "*** ${file.name}"
+
+    def proc = [mkvmergeExe, '-J', file.absolutePath].execute()
+    def json = proc.inputStream.text
+    proc.waitFor()
+
+    if (proc.exitValue() != 0) {
+        println "  (mkvmerge could not identify this file: exit ${proc.exitValue()})"
+        println()
+        return
+    }
+
+    def tracks = new JsonSlurper().parseText(json).tracks
+    if (!tracks) {
+        println "  (no tracks)"
+        println()
+        return
+    }
+
+    printf("  %-4s %-10s %-22s %-5s %-4s %-4s %s%n",
+           'ID', 'TYPE', 'CODEC', 'LANG', 'DEF', 'FOR', 'NAME')
+
+    tracks.each { track ->
+        def props = track.get('properties') ?: [:]
+        printf("  %-4s %-10s %-22s %-5s %-4s %-4s %s%n",
+               track.id,
+               track.type ?: '?',
+               track.codec ?: '?',
+               props.get('language') ?: '?',
+               props.get('default_track') ? 'yes' : 'no',
+               props.get('forced_track') ? 'yes' : 'no',
+               props.get('track_name') ?: '')
+    }
+    println()
+}
 
 def fileName = null
 def extension = null
@@ -227,11 +284,23 @@ addShutdownHook {
     }
 }
 
+// mkvmerge only creates a missing output directory in recent versions (older
+// ones fail to open the output file), so create it here — but not when we are
+// only inspecting, which must leave the filesystem untouched
+if (!identifyOnly && !dryRun) {
+    new File(destinationDir).mkdirs()
+}
+
 files.forEach { file ->
     {
         extension = FilenameUtils.getExtension(file.getName().toLowerCase())
 
         if (allowedExtensions.contains extension) {
+            if (identifyOnly) {
+                identifyFile(file)
+                return
+            }
+
             println "*** Processing ${file.name}"
             println()
 
@@ -239,6 +308,16 @@ files.forEach { file ->
 
             // Build command line based on configuration
             def commandLine = buildCommandLine()
+
+            if (dryRun) {
+                // Force the lazy GStrings now that fileName/extension are set
+                println "*** Dry run, would execute:"
+                println commandLine.collect { it.toString() }
+                                   .collect { it.contains(' ') ? "\"$it\"" : it }
+                                   .join(' ')
+                println()
+                return
+            }
 
             proc = commandLine.execute()
             proc.consumeProcessOutput(System.out, System.err)
