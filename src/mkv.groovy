@@ -23,6 +23,9 @@ def findMkvTool = { String name ->
 
 // Extract general settings from config
 def destinationDir = config.general.destinationDir
+// mkvmerge only creates a missing output directory in recent versions (older
+// ones fail to open the output file), so create it here
+new File(destinationDir).mkdirs()
 def allowedExtensions = config.general.allowedExtensions as Set
 def mkvmergeExe = (config.general.containsKey('mkvmergeExe') && config.general.mkvmergeExe)
     ? config.general.mkvmergeExe
