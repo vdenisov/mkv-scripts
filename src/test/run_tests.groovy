@@ -211,7 +211,10 @@ def cfg = { Map opts = [:] ->
         opts.mainAdditionalOptions.each { sb << "    - \"$it\"\n" }
     }
 
-    sb << "trackOrder: \"${opts.trackOrder ?: '0:0'}\"\n"
+    // Omit the key entirely when not supplied, so tests can exercise derivation
+    if (opts.containsKey('trackOrder') && opts.trackOrder != null) {
+        sb << "trackOrder: \"${opts.trackOrder}\"\n"
+    }
 
     if (opts.additionalSources) {
         sb << "additionalSources:\n"
@@ -574,16 +577,15 @@ runTest('22_invalid_track_id') { workDir ->
     check(out.contains('*** Error:'), 'error reported for bad track id')
 }
 
-// ─── 23. Stale trackOrder with nonexistent ID: silently ignored ──────────────
+// ─── 23. Stale trackOrder with nonexistent ID: warned about, still muxes ─────
 // mkvmerge silently discards track IDs in --track-order that don't correspond
-// to any muxed track, exits 0, and still produces a valid output. This is the
-// "known sharp edge" documented in README — the stale entry is harmless but
-// undetected at the config level.
+// to any muxed track, exits 0, and still produces a valid output. mux.groovy
+// warns about this rather than failing, so the config error is visible.
 runTest('23_stale_track_order') { workDir ->
     stageInput(workDir)
     writeConfig(workDir, cfg(
         audioTracks: [[id:2, language:'en', title:'English', default:true]],
-        trackOrder: '0:0,0:2,0:999'    // 999 doesn't exist — ignored silently
+        trackOrder: '0:0,0:2,0:999'    // 999 doesn't exist — mkvmerge ignores it silently
     ))
     def (code, out) = runMkvGroovy(workDir)
     def outFile = findOutput(workDir)
@@ -591,6 +593,9 @@ runTest('23_stale_track_order') { workDir ->
     check(outFile != null && outFile.exists(), 'output file still produced')
     def tracks = identify(outFile).tracks
     checkEquals(tracks.count { it.type == 'audio' }, 1, 'audio track still present')
+
+    check(out.contains('references track IDs not configured'), 'warns about the unknown ID')
+    check(out.contains('0:999'), 'warning names the offending ID')
 }
 
 // ─── 24. Realistic season-episode golden test ─────────────────────────────────
@@ -738,6 +743,52 @@ runTest('28_identify_lists_tracks') { workDir ->
     check(out.contains('subtitles'), 'lists subtitle tracks')
     check(out.contains('jpn'),       'lists track languages')
     check(!new File(workDir, 'mkv').exists(), 'destination dir not created')
+}
+
+// ─── 29. trackOrder omitted: derived from the configured tracks ──────────────
+runTest('29_derived_track_order') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [
+            [id: 1, language: 'ja', title: 'Japanese', default: true],
+            [id: 2, language: 'en', title: 'English',  default: false]
+        ],
+        subtitleTracks: [[id: 4, language: 'en', title: 'English', default: true]]
+        // trackOrder deliberately omitted
+    ))
+
+    def (code, out) = runMkvGroovy(workDir)
+    check(out.contains('using derived order: 0:0,0:1,0:2,0:4'), 'reports the derived order')
+
+    def tracks = identify(findOutput(workDir)).tracks
+    def audio  = tracks.findAll { it.type == 'audio' }
+    def subs   = tracks.findAll { it.type == 'subtitles' }
+
+    checkEquals(tracks[0].type, 'video', 'video first')
+    checkEquals(audio[0].get('properties').language, 'jpn', 'audio in listed order (jpn first)')
+    checkEquals(audio[1].get('properties').language, 'eng', 'audio in listed order (eng second)')
+    checkEquals(subs.size(), 1, 'subtitle count')
+}
+
+// ─── 30. trackOrder omitting a configured track: warned about ────────────────
+runTest('30_track_order_missing_id_warns') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [
+            [id: 1, language: 'ja', title: 'Japanese', default: true],
+            [id: 2, language: 'en', title: 'English',  default: false]
+        ],
+        trackOrder: '0:0,0:1'    // 0:2 is configured but not ordered
+    ))
+
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('omits configured track IDs'), 'warns about the omitted ID')
+    check(out.contains('0:2'), 'warning names the omitted ID')
+
+    def outFile = findOutput(workDir)
+    check(outFile != null && outFile.exists(), 'output still produced')
+    checkEquals(identify(outFile).tracks.count { it.type == 'audio' }, 2, 'both audio tracks muxed')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────

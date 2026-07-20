@@ -231,13 +231,29 @@ mainSource:
 
 ### Track order
 
-Controls the order of tracks in the output. Each entry is `sourceIndex:trackId`
-where source 0 is the main source. **This string must be kept in sync with the
-track IDs listed above** — a mismatch produces a mkvmerge error.
+Controls the order of tracks in the output. Each entry is `sourceIndex:trackId`,
+where source 0 is the main source.
+
+**`trackOrder` is optional.** When omitted, it is derived from the tracks you
+configured above, in the order you listed them:
+
+1. the video track (`0:0`),
+2. `mainSource.audioTracks`, in listed order,
+3. `mainSource.subtitleTracks`, in listed order,
+4. one entry per `additionalSources` file (`1:0`, `2:0`, …).
+
+For most configs that is exactly what you want, and the derived value is printed
+when the script runs. Set `trackOrder` explicitly only to override it:
 
 ```yaml
 trackOrder: "0:0,0:2,0:1,0:6"
 ```
+
+An explicit `trackOrder` is checked against the configured tracks, and any
+mismatch is reported as a warning — muxing still proceeds. This matters because
+mkvmerge itself **silently ignores** entries that match no muxed track, so a
+stale ID left behind after editing the track lists would otherwise have no
+visible effect at all.
 
 ### Additional sources
 
@@ -265,6 +281,8 @@ additionalSources:
 
 #### Basic configuration with English audio and subtitles
 
+`trackOrder` is omitted here, so it is derived as `0:0,0:1,0:2`:
+
 ```yaml
 mainSource:
   videoTrack:
@@ -279,7 +297,6 @@ mainSource:
       language: "en"
       title: "English"
       default: true
-trackOrder: "0:0,0:1,0:2"
 ```
 
 #### Configuration with multiple audio tracks

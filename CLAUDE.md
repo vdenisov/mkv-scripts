@@ -96,7 +96,7 @@ When adding a wrapper, two things are easy to get wrong and are not caught by CI
 | `mainSource.audioTracks[]` | List of audio track IDs to include, with language/title/default |
 | `mainSource.subtitleTracks[]` | List of subtitle track IDs; `charset` is optional |
 | `additionalSources[]` | Extra files (audio, subtitle) to mux in; track ID is always 0 |
-| `trackOrder` | `"sourceIndex:trackId"` CSV controlling output track order — must be kept in sync manually with the IDs listed above it; mkvmerge silently ignores nonexistent IDs |
+| `trackOrder` | Optional `"sourceIndex:trackId"` CSV controlling output track order. Omit it to derive the order from the configured tracks (video, audioTracks in listed order, subtitleTracks, then one entry per additional source). When set explicitly it is validated against the configured tracks and mismatches are warned about, never fatal — mkvmerge itself silently ignores nonexistent IDs |
 
 Omitting `audioTracks` or `subtitleTracks` (or setting them to `[]`) causes no tracks of that type to be copied.
 

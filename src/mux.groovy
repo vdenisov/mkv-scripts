@@ -109,6 +109,55 @@ def identifyFile = { File file ->
     println()
 }
 
+// The track order the config expresses: video first, then audio tracks and
+// subtitle tracks in the order they are listed, then one track per additional
+// source (which always contributes exactly one track, with ID 0).
+def deriveTrackOrder = {
+    def parts = ['0:0']
+    config.mainSource.audioTracks?.each { parts << "0:${it.id}" }
+    config.mainSource.subtitleTracks?.each { parts << "0:${it.id}" }
+    config.additionalSources?.eachWithIndex { source, i -> parts << "${i + 1}:0" }
+    parts.join(',')
+}
+
+// mkvmerge silently ignores --track-order entries that match no muxed track, so
+// a stale trackOrder fails quietly. Warn instead; never fail, since an existing
+// config that works today must keep working.
+def validateTrackOrder = { String order ->
+    def configured = deriveTrackOrder().split(',') as Set
+    def entries = order.split(',').collect { it.trim() }.findAll { it }
+
+    def malformed = entries.findAll { !(it ==~ /^\d+:\d+$/) }
+    if (malformed) {
+        println "*** Warning: trackOrder contains malformed entries: ${malformed.join(', ')}"
+        println "***          Expected comma-separated sourceIndex:trackId pairs, e.g. \"0:0,0:1,1:0\"."
+    }
+
+    def unknown = entries.findAll { it ==~ /^\d+:\d+$/ } - configured
+    if (unknown) {
+        println "*** Warning: trackOrder references track IDs not configured: ${unknown.join(', ')}"
+        println "***          mkvmerge silently ignores unknown IDs, so these have no effect."
+        println "***          Check trackOrder against mainSource.audioTracks / subtitleTracks / additionalSources."
+    }
+
+    def missing = configured - entries
+    if (missing) {
+        println "*** Warning: trackOrder omits configured track IDs: ${missing.join(', ')}"
+        println "***          These tracks are still muxed, but their position in the output is left to mkvmerge."
+    }
+}
+
+// Resolve once, not per file, so the warnings are printed only once
+def effectiveTrackOrder
+if (config.containsKey('trackOrder') && config.trackOrder) {
+    effectiveTrackOrder = config.trackOrder.toString()
+    validateTrackOrder(effectiveTrackOrder)
+} else {
+    effectiveTrackOrder = deriveTrackOrder()
+    println "*** trackOrder not configured; using derived order: ${effectiveTrackOrder}"
+    println()
+}
+
 def fileName = null
 def extension = null
 
@@ -264,7 +313,7 @@ def buildCommandLine = {
         "--title",
         "${-> fileName}", // Use filename as title
         "--track-order",
-        config.trackOrder
+        effectiveTrackOrder
     ])
 
     return commandLine
