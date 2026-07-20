@@ -1,0 +1,14 @@
+# IDE / build artifacts
+.idea/
+*.iml
+out/
+.claude/
+
+# Secrets and personal data
+apikey.txt
+episodes.txt
+episodes.txt.bak
+http-client.private.env.json
+
+# Test artifacts
+work/

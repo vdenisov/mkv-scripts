@@ -1,0 +1,66 @@
+# MKV Muxing Configuration
+
+# General settings
+general:
+  destinationDir: "mkv"
+  allowedExtensions: ["mkv", "avi", "mp4"]
+  mkvmergeExe: "C:\\Program Files\\MKVToolNix\\mkvmerge.exe"
+
+# Main source track settings
+mainSource:
+  videoTrack:
+    language: "en"
+    # title will be set to filename by default
+    # Uncomment to override video track name
+    # title: "Custom Video Title"
+
+  audioTracks:
+    - id: 2
+      language: "en"
+      title: "English"
+      default: true
+    - id: 1
+      language: "ru"
+      title: "Russian"
+      default: false
+    # Uncomment to add a third audio track
+    # - id: 13
+    #   language: "en"
+    #   title: "English"
+    #   default: false
+
+  subtitleTracks:
+    - id: 6
+      language: "en"
+      title: "English"
+      charset: "UTF-8"
+      default: true
+    # Uncomment to add a second subtitle track
+    # - id: 17
+    #   language: "en"
+    #   title: "English"
+    #   charset: "UTF-8"
+    #   default: true
+
+  # Additional command-line options for main source
+  # additionalOptions:
+  #   - "--compression"
+  #   - "0:none"
+
+
+# Track order (source:id pairs)
+trackOrder: "0:0,0:2,0:1,0:6"
+
+# Additional sources
+# Uncomment to add a second source file
+# additionalSources:
+#   - file: "${fileName}[Dub Studio].mka"
+#     tracks:
+#       - language: "en"
+#         title: "English"
+#         charset: "UTF-8"  # Optional: specify charset for subtitle tracks
+#         default: false
+#     # Additional command-line options for this source
+#     # additionalOptions:
+#     #   - "--compression"
+#     #   - "0:none"

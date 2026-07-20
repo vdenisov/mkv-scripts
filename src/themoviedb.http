@@ -1,0 +1,13 @@
+# TheMovieDB API examples used by fetch_episodes.groovy.
+# Supply the API key via an IntelliJ HTTP Client private environment file
+# (http-client.private.env.json, not committed): {"dev": {"apiKey": "<your key>"}}
+
+### Get show information by ID
+GET https://api.themoviedb.org/3/tv/2260?api_key={{apiKey}}&language=en-US
+
+### Search for the show by name (get ID)
+GET https://api.themoviedb.org/3/search/tv?api_key={{apiKey}}&language=en-US&page=1&query=H2O%20Just%20add%20water&include_adult=false
+
+### Get the list of episodes for a season
+GET https://api.themoviedb.org/3/tv/2260/season/1?api_key={{apiKey}}&language=en-US
+Accept: application/json

@@ -1,0 +1,642 @@
+@Grab('info.picocli:picocli-groovy:4.6.3')
+@Grab('commons-io:commons-io:2.11.0')
+@GrabConfig(systemClassLoader=true)
+import groovy.transform.Field
+import picocli.CommandLine
+import picocli.groovy.PicocliScript2
+import org.apache.commons.io.FileUtils
+import groovy.json.JsonSlurper
+
+@CommandLine.Command(name='run_tests', mixinStandardHelpOptions=true,
+                     description='Run the mkv.groovy test suite')
+@PicocliScript2
+
+@CommandLine.Option(names=['-f', '--filter'], description='Run only tests whose name contains this string')
+@Field String filterPattern = null
+
+@CommandLine.Option(names=['-k', '--keep'], description='Preserve work/ directory after run')
+@Field boolean keepWork = false
+
+@CommandLine.Option(names=['--mkvmerge-exe'], paramLabel='PATH',
+                    description='Path to mkvmerge executable (default: auto-detect from PATH)')
+@Field String mkvmergeExeOverride = null
+
+// ─── Paths ──────────────────────────────────────────────────────────────────
+
+def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+def repoRoot  = scriptDir.parentFile.parentFile          // …/mkv-script
+def testMkv   = new File(scriptDir, 'test.mkv')
+def mkvgroovy = new File(repoRoot, 'src/mkv.groovy')
+def workRoot  = new File(scriptDir, 'work')
+
+def isWindows = System.getProperty('os.name').toLowerCase().contains('win')
+def groovyBin = isWindows ? 'bin/groovy.bat' : 'bin/groovy'
+def groovyExe = new File(System.getProperty('groovy.home', ''), groovyBin).with {
+    exists() ? absolutePath : 'groovy'
+}
+
+def findMkvTool = { String name ->
+    try {
+        def proc = [name, '--version'].execute()
+        proc.waitFor()
+        if (proc.exitValue() == 0) return name
+    } catch (ignored) {}
+    if (isWindows) {
+        def path = "C:\\Program Files\\MKVToolNix\\${name}.exe"
+        if (new File(path).exists()) return path
+    }
+    throw new RuntimeException("'$name' not found on PATH or in default install location. Install MKVToolNix.")
+}
+
+def mkvmergeExe = mkvmergeExeOverride ?: findMkvTool('mkvmerge')
+
+assert testMkv.exists()   : "test.mkv not found at $testMkv"
+assert mkvgroovy.exists() : "mkv.groovy not found at $mkvgroovy"
+
+// ─── Helpers (closures so they capture script-scope variables) ───────────────
+
+def failures = []
+def passes   = []
+
+/** Run a command list; return [exitCode, stdout+stderr combined]. */
+def exec = { cmd, File cwd = null ->
+    def pb = new ProcessBuilder(cmd.collect { it.toString() })
+    pb.redirectErrorStream(true)
+    // Ensure JAVA_HOME points at the JVM actually running this process
+    pb.environment().put('JAVA_HOME', System.getProperty('java.home'))
+    if (cwd) pb.directory(cwd)
+    def proc = pb.start()
+    def out = proc.inputStream.text
+    proc.waitFor()
+    [proc.exitValue(), out]
+}
+
+/** mkvmerge -J on a file; return parsed JSON map.
+ *  NOTE: read the "properties" key of the result via .get('properties') — on
+ *  Groovy 4+ both map.properties and map['properties'] resolve to the bean
+ *  properties of the map object itself, not the JSON key of that name. */
+def identify = { File f ->
+    def (code, out) = exec([mkvmergeExe, '-J', f.absolutePath])
+    assert code == 0 : "mkvmerge -J failed on $f"
+    new JsonSlurper().parseText(out)
+}
+
+/** Extract a single track from src into destFile.
+ *  trackType: 'audio' | 'subtitle'. trackId: integer track id in source. */
+def extractTrack = { File src, File destFile, String trackType, int trackId ->
+    def flag   = trackType == 'audio' ? '--audio-tracks' : '--subtitle-tracks'
+    def noFlag = trackType == 'audio' ? '--no-subtitles' : '--no-audio'
+    destFile.parentFile?.mkdirs()
+    def (code, out) = exec([
+        mkvmergeExe, '--output', destFile.absolutePath,
+        '--no-video', noFlag, flag, "$trackId",
+        src.absolutePath
+    ])
+    assert (code == 0 || code == 1) : "extractTrack failed (exit $code):\n$out"
+}
+
+/** Write config.yaml into workDir/src/config.yaml. */
+def writeConfig = { File workDir, String yaml ->
+    def cfgDir = new File(workDir, 'src')
+    cfgDir.mkdirs()
+    new File(cfgDir, 'config.yaml').text = yaml
+}
+
+/** Copy test.mkv into workDir under the given name. */
+def stageInput = { File workDir, String name = 'test.mkv' ->
+    def dest = new File(workDir, name)
+    FileUtils.copyFile(testMkv, dest)
+    dest
+}
+
+/** Run mkv.groovy from workDir; return [exitCode, output]. */
+def runMkvGroovy = { File workDir ->
+    exec([groovyExe, mkvgroovy.absolutePath], workDir)
+}
+
+/** Find the single output MKV in workDir/<destDir>. */
+def findOutput = { File workDir, String destDir = 'mkv' ->
+    new File(workDir, destDir).listFiles()?.find { it.name.endsWith('.mkv') }
+}
+
+def check = { boolean cond, String msg ->
+    if (!cond) throw new AssertionError(msg)
+}
+
+def checkEquals = { actual, expected, String label ->
+    if (actual != expected) throw new AssertionError("$label: expected <$expected> but got <$actual>")
+}
+
+/** Run a named test case; handle pass/fail bookkeeping. */
+def runTest = { String name, Closure body ->
+    if (filterPattern && !name.contains(filterPattern)) return
+
+    def workDir = new File(workRoot, name.replaceAll(/[^a-zA-Z0-9_-]/, '_'))
+    if (workDir.exists()) try { FileUtils.deleteDirectory(workDir) } catch (ignored) {}
+    workDir.mkdirs()
+
+    try {
+        body(workDir)
+        passes << name
+        println "[PASS] $name"
+    } catch (Throwable t) {
+        failures << [name: name, msg: t.message ?: t.toString()]
+        println "[FAIL] $name: ${t.message ?: t}"
+    } finally {
+        if (!keepWork && !failures.find { it.name == name }) {
+            try { FileUtils.deleteDirectory(workDir) } catch (ignored) {}
+        }
+    }
+}
+
+// ─── Config builder ──────────────────────────────────────────────────────────
+
+/** Build a config.yaml string from a map of options. */
+def cfg = { Map opts = [:] ->
+    def dest   = opts.destinationDir ?: 'mkv'
+    def exts   = opts.extensions     ?: ['mkv', 'avi', 'mp4']
+    def extStr = exts.collect { "\"$it\"" }.join(', ')
+
+    def sb = new StringBuilder()
+    sb << "general:\n"
+    sb << "  destinationDir: \"$dest\"\n"
+    sb << "  allowedExtensions: [$extStr]\n"
+    sb << "  mkvmergeExe: \"${mkvmergeExe.replace('\\', '\\\\')}\"\n"
+
+    sb << "mainSource:\n"
+    sb << "  videoTrack:\n"
+    sb << "    language: \"${opts.videoLang ?: 'en'}\"\n"
+    if (opts.videoTitle) sb << "    title: \"${opts.videoTitle}\"\n"
+
+    if (opts.containsKey('audioTracks')) {
+        if (!opts.audioTracks) {
+            sb << "  audioTracks: []\n"
+        } else {
+            sb << "  audioTracks:\n"
+            opts.audioTracks.each { t ->
+                sb << "    - id: ${t.id}\n"
+                sb << "      language: \"${t.language}\"\n"
+                sb << "      title: \"${t.title}\"\n"
+                sb << "      default: ${t.default}\n"
+            }
+        }
+    }
+
+    if (opts.containsKey('subtitleTracks')) {
+        if (!opts.subtitleTracks) {
+            sb << "  subtitleTracks: []\n"
+        } else {
+            sb << "  subtitleTracks:\n"
+            opts.subtitleTracks.each { t ->
+                sb << "    - id: ${t.id}\n"
+                sb << "      language: \"${t.language}\"\n"
+                sb << "      title: \"${t.title}\"\n"
+                if (t.charset) sb << "      charset: \"${t.charset}\"\n"
+                sb << "      default: ${t.default}\n"
+            }
+        }
+    }
+
+    if (opts.mainAdditionalOptions) {
+        sb << "  additionalOptions:\n"
+        opts.mainAdditionalOptions.each { sb << "    - \"$it\"\n" }
+    }
+
+    sb << "trackOrder: \"${opts.trackOrder ?: '0:0'}\"\n"
+
+    if (opts.additionalSources) {
+        sb << "additionalSources:\n"
+        opts.additionalSources.each { src ->
+            sb << "  - file: \"${src.file.replace('\\', '\\\\')}\"\n"
+            sb << "    tracks:\n"
+            src.tracks.each { t ->
+                sb << "      - language: \"${t.language}\"\n"
+                sb << "        title: \"${t.title}\"\n"
+                if (t.charset) sb << "        charset: \"${t.charset}\"\n"
+                sb << "        default: ${t.default}\n"
+            }
+            if (src.additionalOptions) {
+                sb << "    additionalOptions:\n"
+                src.additionalOptions.each { sb << "      - \"$it\"\n" }
+            }
+        }
+    }
+
+    sb.toString()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TEST.MKV layout (track IDs as reported by mkvmerge):
+//   0  video   und  H.264
+//   1  audio   jpn  AAC    "Audio A"
+//   2  audio   eng  AAC    "Audio B"
+//   3  audio   rus  AAC    "Audio C"
+//   4  sub     eng  SRT    "Subtitle A"
+//   5  sub     rus  SRT    "Subtitle B" (forced)
+//   6  sub     jpn  SRT    "Subtitle C"
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── 1. Pick one audio + one subtitle ────────────────────────────────────────
+runTest('01_one_audio_one_subtitle') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        subtitleTracks: [[id:4, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2,0:4'
+    ))
+    runMkvGroovy(workDir)
+    def tracks = identify(findOutput(workDir)).tracks
+    checkEquals(tracks.count { it.type == 'video' },     1, 'video count')
+    checkEquals(tracks.count { it.type == 'audio' },     1, 'audio count')
+    checkEquals(tracks.count { it.type == 'subtitles' }, 1, 'subtitle count')
+    check(tracks.find { it.type == 'audio' }.get('properties').language == 'eng',     'audio lang eng')
+    check(tracks.find { it.type == 'subtitles' }.get('properties').language == 'eng', 'sub lang eng')
+}
+
+// ─── 2. Multiple audio, jpn default ──────────────────────────────────────────
+runTest('02_multiple_audio_jpn_default') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [
+            [id:1, language:'ja', title:'Japanese', default:true],
+            [id:2, language:'en', title:'English',  default:false]
+        ],
+        trackOrder: '0:0,0:1,0:2'
+    ))
+    runMkvGroovy(workDir)
+    def audioTracks = identify(findOutput(workDir)).tracks.findAll { it.type == 'audio' }
+    checkEquals(audioTracks.size(), 2, 'audio count')
+    checkEquals(audioTracks[0].get('properties').language,      'jpn',  'first audio lang')
+    checkEquals(audioTracks[0].get('properties').default_track, true,   'jpn default=true')
+    checkEquals(audioTracks[1].get('properties').default_track, false,  'eng default=false')
+}
+
+// ─── 3. No audio (key omitted) ───────────────────────────────────────────────
+runTest('03_no_audio_key_omitted') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        subtitleTracks: [[id:4, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:4'
+    ))
+    runMkvGroovy(workDir)
+    def tracks = identify(findOutput(workDir)).tracks
+    checkEquals(tracks.count { it.type == 'audio' },     0, 'audio count')
+    checkEquals(tracks.count { it.type == 'subtitles' }, 1, 'sub count')
+}
+
+// ─── 4. No audio (empty list) ────────────────────────────────────────────────
+runTest('04_no_audio_empty_list') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [],
+        subtitleTracks: [[id:4, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:4'
+    ))
+    runMkvGroovy(workDir)
+    checkEquals(identify(findOutput(workDir)).tracks.count { it.type == 'audio' }, 0, 'audio count')
+}
+
+// ─── 5. No subtitles (key omitted) ───────────────────────────────────────────
+runTest('05_no_subtitles_key_omitted') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+    checkEquals(identify(findOutput(workDir)).tracks.count { it.type == 'subtitles' }, 0, 'subtitle count')
+}
+
+// ─── 6. No subtitles (empty list) ────────────────────────────────────────────
+runTest('06_no_subtitles_empty_list') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        subtitleTracks: [],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+    checkEquals(identify(findOutput(workDir)).tracks.count { it.type == 'subtitles' }, 0, 'subtitle count')
+}
+
+// ─── 7. Video language override ──────────────────────────────────────────────
+runTest('07_video_language_override') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        videoLang: 'ja',
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+    def vid = identify(findOutput(workDir)).tracks.find { it.type == 'video' }
+    checkEquals(vid.get('properties').language, 'jpn', 'video language')
+}
+
+// ─── 8. Video title defaults to filename ─────────────────────────────────────
+runTest('08_video_title_defaults_to_filename') { workDir ->
+    stageInput(workDir, 'MyShow.S01E01.mkv')
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+    def outFile = new File(workDir, 'mkv').listFiles()?.find { it.name.endsWith('.mkv') }
+    def baseName = outFile.name.replace('.mkv', '')
+    def info = identify(outFile)
+    checkEquals(info.container.get('properties').title,                                       baseName, 'segment title')
+    checkEquals(info.tracks.find { it.type == 'video' }.get('properties').track_name, baseName, 'video track name')
+}
+
+// ─── 9. Video title override ──────────────────────────────────────────────────
+runTest('09_video_title_override') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        videoTitle: 'Custom Title',
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+    def info = identify(findOutput(workDir))
+    checkEquals(info.tracks.find { it.type == 'video' }.get('properties').track_name, 'Custom Title', 'video track name')
+    check(info.container.get('properties').title != 'Custom Title', 'segment title is filename, not override')
+}
+
+// ─── 10. Default flags on multiple audio tracks ───────────────────────────────
+runTest('10_default_flags_audio') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [
+            [id:1, language:'ja', title:'Japanese', default:false],
+            [id:2, language:'en', title:'English',  default:true],
+            [id:3, language:'ru', title:'Russian',  default:false]
+        ],
+        trackOrder: '0:0,0:1,0:2,0:3'
+    ))
+    runMkvGroovy(workDir)
+    def a = identify(findOutput(workDir)).tracks.findAll { it.type == 'audio' }
+    checkEquals(a.size(), 3, 'audio count')
+    checkEquals(a[0].get('properties').default_track, false, 'jpn default=false')
+    checkEquals(a[1].get('properties').default_track, true,  'eng default=true')
+    checkEquals(a[2].get('properties').default_track, false, 'rus default=false')
+}
+
+// ─── 11. Subtitle without charset (must not crash) ───────────────────────────
+runTest('11_subtitle_no_charset') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        subtitleTracks: [[id:4, language:'en', title:'English', default:true]],  // no charset
+        trackOrder: '0:0,0:2,0:4'
+    ))
+    runMkvGroovy(workDir)
+    def outFile = findOutput(workDir)
+    check(outFile != null && outFile.exists(), 'output file created')
+    checkEquals(identify(outFile).tracks.count { it.type == 'subtitles' }, 1, 'sub count')
+}
+
+// ─── 12. Subtitle with explicit charset ──────────────────────────────────────
+runTest('12_subtitle_with_charset') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        subtitleTracks: [[id:5, language:'ru', title:'Russian', charset:'UTF-8', default:false]],
+        trackOrder: '0:0,0:2,0:5'
+    ))
+    runMkvGroovy(workDir)
+    def subs = identify(findOutput(workDir)).tracks.findAll { it.type == 'subtitles' }
+    checkEquals(subs.size(), 1, 'sub count')
+    checkEquals(subs[0].get('properties').language, 'rus', 'sub lang')
+}
+
+// ─── 13. Forced subtitle flag preserved ──────────────────────────────────────
+runTest('13_forced_subtitle_preserved') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        subtitleTracks: [[id:5, language:'ru', title:'Forced', default:false]],
+        trackOrder: '0:0,0:2,0:5'
+    ))
+    runMkvGroovy(workDir)
+    def sub = identify(findOutput(workDir)).tracks.find { it.type == 'subtitles' }
+    check(sub != null, 'subtitle present')
+    checkEquals(sub.get('properties').forced_track, true, 'forced flag preserved')
+}
+
+// ─── 14. trackOrder controls output track order ───────────────────────────────
+runTest('14_track_order_reorders_audio') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [
+            [id:1, language:'ja', title:'Japanese', default:false],
+            [id:2, language:'en', title:'English',  default:true]
+        ],
+        trackOrder: '0:0,0:2,0:1'   // eng before jpn
+    ))
+    runMkvGroovy(workDir)
+    def a = identify(findOutput(workDir)).tracks.findAll { it.type == 'audio' }
+    checkEquals(a[0].get('properties').language, 'eng', 'first audio lang')
+    checkEquals(a[1].get('properties').language, 'jpn', 'second audio lang')
+}
+
+// ─── 15. External audio companion via ${fileName} ────────────────────────────
+runTest('15_external_audio_companion') { workDir ->
+    stageInput(workDir)
+    extractTrack(testMkv, new File(workDir, 'test[Extra].mka'), 'audio', 2)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:1, language:'ja', title:'Japanese', default:true]],
+        trackOrder: '0:0,0:1,1:0',
+        additionalSources: [[
+            file: '${fileName}[Extra].mka',
+            tracks: [[language:'en', title:'Extra English', default:false]]
+        ]]
+    ))
+    runMkvGroovy(workDir)
+    def a = identify(findOutput(workDir)).tracks.findAll { it.type == 'audio' }
+    checkEquals(a.size(), 2, 'audio count')
+    check(a.any { it.get('properties').track_name == 'Extra English' }, 'Extra English track present')
+}
+
+// ─── 16. External SRT companion with charset ─────────────────────────────────
+runTest('16_external_srt_with_charset') { workDir ->
+    stageInput(workDir)
+    extractTrack(testMkv, new File(workDir, 'test.srt'), 'subtitle', 4)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2,1:0',
+        additionalSources: [[
+            file: '${fileName}.srt',
+            tracks: [[language:'en', title:'ExtSub', charset:'UTF-8', default:false]]
+        ]]
+    ))
+    runMkvGroovy(workDir)
+    def subs = identify(findOutput(workDir)).tracks.findAll { it.type == 'subtitles' }
+    checkEquals(subs.size(), 1, 'sub count')
+    checkEquals(subs[0].get('properties').track_name, 'ExtSub', 'sub title')
+}
+
+// ─── 17. External SRT without charset ────────────────────────────────────────
+runTest('17_external_srt_no_charset') { workDir ->
+    stageInput(workDir)
+    extractTrack(testMkv, new File(workDir, 'test.srt'), 'subtitle', 4)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2,1:0',
+        additionalSources: [[
+            file: '${fileName}.srt',
+            tracks: [[language:'en', title:'ExtSubNoCharset', default:false]]
+        ]]
+    ))
+    runMkvGroovy(workDir)
+    checkEquals(identify(findOutput(workDir)).tracks.count { it.type == 'subtitles' }, 1, 'sub count')
+}
+
+// ─── 18. Two additional sources ───────────────────────────────────────────────
+runTest('18_two_additional_sources') { workDir ->
+    stageInput(workDir)
+    extractTrack(testMkv, new File(workDir, 'test[ExtraAudio].mka'), 'audio',    2)
+    extractTrack(testMkv, new File(workDir, 'test[ExtraSub].srt'),   'subtitle', 4)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:1, language:'ja', title:'Japanese', default:true]],
+        trackOrder: '0:0,0:1,1:0,2:0',
+        additionalSources: [
+            [file: '${fileName}[ExtraAudio].mka', tracks: [[language:'en', title:'ExtraAudio', default:false]]],
+            [file: '${fileName}[ExtraSub].srt',   tracks: [[language:'en', title:'ExtraSub',   default:false]]]
+        ]
+    ))
+    runMkvGroovy(workDir)
+    def tracks = identify(findOutput(workDir)).tracks
+    checkEquals(tracks.count { it.type == 'audio' },     2, 'audio count')
+    checkEquals(tracks.count { it.type == 'subtitles' }, 1, 'sub count')
+    check(tracks.any { it.get('properties').track_name == 'ExtraAudio' }, 'ExtraAudio present')
+    check(tracks.any { it.get('properties').track_name == 'ExtraSub' },   'ExtraSub present')
+}
+
+// ─── 19. allowedExtensions filters non-matching files ────────────────────────
+runTest('19_extensions_filter') { workDir ->
+    stageInput(workDir)
+    new File(workDir, 'notes.txt').text = 'not a video'
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    def (code, out) = runMkvGroovy(workDir)
+    check(out.contains('Skipping notes.txt'), 'notes.txt reported as skipped')
+    def outputs = new File(workDir, 'mkv').listFiles()?.findAll { it.name.endsWith('.mkv') } ?: []
+    checkEquals(outputs.size(), 1, 'exactly one output')
+}
+
+// ─── 20. Multiple inputs produce multiple outputs ─────────────────────────────
+runTest('20_multiple_inputs') { workDir ->
+    stageInput(workDir, 'episode01.mkv')
+    stageInput(workDir, 'episode02.mkv')
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+    def outputs = new File(workDir, 'mkv').listFiles()?.findAll { it.name.endsWith('.mkv') } ?: []
+    checkEquals(outputs.size(), 2, 'two outputs produced')
+}
+
+// ─── 21. destinationDir created if missing ────────────────────────────────────
+runTest('21_destination_dir_created') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        destinationDir: 'output_new',
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+    def destDir = new File(workDir, 'output_new')
+    check(destDir.exists() && destDir.isDirectory(), 'destinationDir was created')
+    check(destDir.listFiles()?.any { it.name.endsWith('.mkv') }, 'output file in new dir')
+}
+
+// ─── 22. Invalid track id: error reported, script does not crash ──────────────
+runTest('22_invalid_track_id') { workDir ->
+    stageInput(workDir, 'episode01.mkv')
+    stageInput(workDir, 'episode02.mkv')
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:99, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:99'
+    ))
+    def (code, out) = runMkvGroovy(workDir)
+    check(out.contains('*** Done'),  'script completed without crash')
+    check(out.contains('*** Error:'), 'error reported for bad track id')
+}
+
+// ─── 23. Stale trackOrder with nonexistent ID: silently ignored ──────────────
+// mkvmerge silently discards track IDs in --track-order that don't correspond
+// to any muxed track, exits 0, and still produces a valid output. This is the
+// "known sharp edge" documented in README — the stale entry is harmless but
+// undetected at the config level.
+runTest('23_stale_track_order') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2,0:999'    // 999 doesn't exist — ignored silently
+    ))
+    def (code, out) = runMkvGroovy(workDir)
+    def outFile = findOutput(workDir)
+    check(out.contains('*** Done'), 'script completes normally')
+    check(outFile != null && outFile.exists(), 'output file still produced')
+    def tracks = identify(outFile).tracks
+    checkEquals(tracks.count { it.type == 'audio' }, 1, 'audio track still present')
+}
+
+// ─── 24. Realistic season-episode golden test ─────────────────────────────────
+runTest('24_realistic_season_episode') { workDir ->
+    stageInput(workDir, 'ShowName.S01E01.mkv')
+    writeConfig(workDir, cfg(
+        videoLang: 'ja',
+        audioTracks: [
+            [id:1, language:'ja', title:'Japanese', default:true],
+            [id:2, language:'en', title:'English',  default:false]
+        ],
+        subtitleTracks: [
+            [id:4, language:'en', title:'English',  default:true],
+            [id:6, language:'ja', title:'Japanese', default:false]
+        ],
+        trackOrder: '0:0,0:1,0:2,0:4,0:6'
+    ))
+    runMkvGroovy(workDir)
+    def info   = identify(findOutput(workDir))
+    def tracks = info.tracks
+
+    checkEquals(info.container.get('properties').title,            'ShowName.S01E01', 'segment title')
+    checkEquals(tracks.count { it.type == 'video' },     1, 'video count')
+    checkEquals(tracks.count { it.type == 'audio' },     2, 'audio count')
+    checkEquals(tracks.count { it.type == 'subtitles' }, 2, 'subtitle count')
+
+    def a = tracks.findAll { it.type == 'audio' }
+    checkEquals(a[0].get('properties').language,      'jpn',  'audio[0] lang')
+    checkEquals(a[0].get('properties').default_track, true,   'audio[0] default')
+    checkEquals(a[1].get('properties').language,      'eng',  'audio[1] lang')
+    checkEquals(a[1].get('properties').default_track, false,  'audio[1] default')
+
+    def s = tracks.findAll { it.type == 'subtitles' }
+    checkEquals(s[0].get('properties').language,      'eng',  'sub[0] lang')
+    checkEquals(s[0].get('properties').default_track, true,   'sub[0] default')
+    checkEquals(s[1].get('properties').language,      'jpn',  'sub[1] lang')
+    checkEquals(s[1].get('properties').default_track, false,  'sub[1] default')
+
+    checkEquals(a[0].get('properties').track_name, 'Japanese', 'audio[0] name')
+    checkEquals(a[1].get('properties').track_name, 'English',  'audio[1] name')
+    checkEquals(s[0].get('properties').track_name, 'English',  'sub[0] name')
+    checkEquals(s[1].get('properties').track_name, 'Japanese', 'sub[1] name')
+
+    def langs = tracks.collect { it.get('properties').language }
+    check(!langs.contains('rus'), 'no Russian tracks in output')
+}
+
+// ─── Summary ─────────────────────────────────────────────────────────────────
+
+println()
+println '═' * 50
+println "${passes.size()} passed, ${failures.size()} failed"
+if (failures) {
+    println()
+    println 'FAILURES:'
+    failures.each { println "  [FAIL] ${it.name}: ${it.msg}" }
+    System.exit(1)
+}
