@@ -374,6 +374,72 @@ if ((fileMasks || excludeMasks) && !files) {
     return
 }
 
+// Wrap a long list of file names onto indented lines, truncating past `limit`.
+// A season's worth of names on one line is unreadable, and the whole point of
+// these reports is that they can be skimmed. ASCII only: this output lands on
+// Windows consoles running a legacy codepage, where "…" would be mangled.
+def formatFileList = { List<String> names, String indent, int limit = 8, int width = 96 ->
+    def shown = names.take(limit)
+    def more = names.size() - shown.size()
+    def items = shown.withIndex().collect { name, i ->
+        (i < shown.size() - 1 || more > 0) ? "${name}," : name
+    }
+    if (more > 0) items << "... and ${more} more"
+
+    def lines = []
+    def current = new StringBuilder()
+    items.each { item ->
+        if (current.length() && indent.length() + current.length() + 1 + item.length() > width) {
+            lines << current.toString()
+            current = new StringBuilder()
+        }
+        if (current.length()) current << ' '
+        current << item
+    }
+    if (current.length()) lines << current.toString()
+    lines.collect { indent + it }
+}
+
+// Companion files are resolved per episode through the ${fileName} placeholder,
+// so a dub or subtitle release covering only part of a season shows up as an
+// mkvmerge failure partway through a long batch. Check them all up front and
+// drop just the affected episodes: those would have failed anyway, and the rest
+// of the batch is still worth muxing.
+def companionSources = config.additionalSources ?: []
+if (companionSources && !identifyOnly) {
+    def missingBySource = new LinkedHashMap()
+    def blocked = [] as Set
+
+    files.findAll { allowedExtensions.contains(FilenameUtils.getExtension(it.name.toLowerCase())) }
+         .each { file ->
+             def base = FilenameUtils.getBaseName(file.name)
+             companionSources.each { source ->
+                 if (!new File(source.file.replace('${fileName}', base)).isFile()) {
+                     missingBySource.get(source.file, []) << file.name
+                     blocked << file.name
+                 }
+             }
+         }
+
+    if (blocked) {
+        println "*** ${blocked.size()} file(s) will be skipped: companion files are missing"
+        missingBySource.each { pattern, names ->
+            println "      ${pattern}  (missing for ${names.size()} file(s))"
+            formatFileList(names, '        ').each { println it }
+        }
+        println()
+
+        files = files.findAll { !blocked.contains(it.name) }
+
+        if (!files.any { allowedExtensions.contains(FilenameUtils.getExtension(it.name.toLowerCase())) }) {
+            println "*** Nothing left to mux"
+            println()
+            println "*** Done"
+            return
+        }
+    }
+}
+
 Process proc = null
 
 addShutdownHook {

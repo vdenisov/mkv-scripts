@@ -1142,6 +1142,87 @@ runTest('45_file_mask_applies_to_identify') { workDir ->
     check(!new File(workDir, 'mkv').exists(), 'identify still muxes nothing')
 }
 
+// ─── Companion file pre-flight ───────────────────────────────────────────────
+// A dub studio releasing 22 of 24 episodes is normal. Without the pre-flight
+// that surfaces as an mkvmerge failure partway through a long batch; with it,
+// the two bad episodes are named up front and the other 22 still get muxed.
+
+/** Config with one ${fileName} companion source. */
+def companionCfg = {
+    cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true]],
+        trackOrder: '0:0,0:1,1:0',
+        additionalSources: [[
+            file: '${fileName}[Studio].mka',
+            tracks: [[language: 'ru', title: 'Studio Dub', default: false]]
+        ]])
+}
+
+// ─── 46. a missing companion skips that episode and muxes the rest ───────────
+runTest('46_missing_companion_skips_that_episode') { workDir ->
+    stageInput(workDir, 'Show.S01E01.mkv')
+    stageInput(workDir, 'Show.S01E02.mkv')
+    // Only episode 1 has its companion
+    extractTrack(testMkv, new File(workDir, 'Show.S01E01[Studio].mka'), 'audio', 2)
+    writeConfig(workDir, companionCfg())
+
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('companion files are missing'), 'announces the skip')
+    check(out.contains('${fileName}[Studio].mka'), 'names the source pattern')
+    check(out.contains('Show.S01E02.mkv'), 'names the affected episode')
+
+    checkEquals(outputNames(workDir), ['Show.S01E01.mkv'], 'only the complete episode was muxed')
+
+    // and the one that was muxed really did get its companion track
+    def audio = identify(new File(workDir, 'mkv/Show.S01E01.mkv')).tracks.findAll { it.type == 'audio' }
+    check(audio.any { it.get('properties').track_name == 'Studio Dub' }, 'companion track muxed in')
+}
+
+// ─── 47. every companion present: no message, nothing skipped ────────────────
+runTest('47_companions_all_present') { workDir ->
+    stageInput(workDir, 'Show.S01E01.mkv')
+    stageInput(workDir, 'Show.S01E02.mkv')
+    extractTrack(testMkv, new File(workDir, 'Show.S01E01[Studio].mka'), 'audio', 2)
+    extractTrack(testMkv, new File(workDir, 'Show.S01E02[Studio].mka'), 'audio', 2)
+    writeConfig(workDir, companionCfg())
+
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(!out.contains('companion files are missing'), 'no skip message when nothing is missing')
+    checkEquals(outputNames(workDir), ['Show.S01E01.mkv', 'Show.S01E02.mkv'], 'both muxed')
+}
+
+// ─── 48. the pre-flight reports under --dry-run too ──────────────────────────
+runTest('48_missing_companion_reported_in_dry_run') { workDir ->
+    stageInput(workDir, 'Show.S01E01.mkv')
+    stageInput(workDir, 'Show.S01E02.mkv')
+    extractTrack(testMkv, new File(workDir, 'Show.S01E01[Studio].mka'), 'audio', 2)
+    writeConfig(workDir, companionCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--dry-run'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('companion files are missing'), 'announces the skip')
+    check(out.contains('Show.S01E01.mkv'),  'still previews the complete episode')
+    // The blocked episode must not get a command line printed for it
+    check(!out.contains('Show.S01E02.mkv.mkv'), 'no output path previewed for the blocked episode')
+    check(!new File(workDir, 'mkv').exists(), 'dry run creates nothing')
+}
+
+// ─── 49. every episode blocked: says so rather than printing a bare Done ─────
+runTest('49_all_companions_missing') { workDir ->
+    stageInput(workDir, 'Show.S01E01.mkv')
+    stageInput(workDir, 'Show.S01E02.mkv')
+    writeConfig(workDir, companionCfg())
+
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('companion files are missing'), 'announces the skip')
+    check(out.contains('Nothing left to mux'), 'says the batch is empty rather than just Done')
+    checkEquals(outputNames(workDir), [], 'nothing muxed')
+    // The pre-flight bails before the mkdirs, so an empty batch leaves no litter
+    check(!new File(workDir, 'mkv').exists(), 'destination directory not created')
+}
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 println()

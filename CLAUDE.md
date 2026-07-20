@@ -36,7 +36,7 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 45 tests
+groovy src/test/run_tests.groovy              # Run all 49 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```
@@ -92,6 +92,8 @@ The script uses picocli via `@PicocliScript2` (like `rename.groovy` and `fetch_e
 Lazy GString closures (`${-> fileName}`) are used throughout `buildCommandLine` so that `fileName` and `extension` are evaluated at command execution time, not at closure definition time.
 
 `additionalSources` entries support a `${fileName}` placeholder that resolves to the base filename of the current main source file, enabling per-episode companion files like `${fileName}[Studio].mka`.
+
+**Companion pre-flight.** Before muxing (and before `--dry-run` previews, but not `--identify`), every `additionalSources` path is resolved per episode and checked for existence. Episodes with missing companions are reported and dropped from the batch; the rest still mux. This never aborts — those episodes would have failed in mkvmerge anyway, and a partially-released dub is a normal situation. The check runs before the `destinationDir` `mkdirs()`, so a fully-blocked batch leaves no empty output directory behind. `formatFileList` wraps and truncates the name lists (ASCII only — this output reaches Windows consoles on legacy codepages); `--check` in item 3 reuses it.
 
 ## `bin/` wrappers
 

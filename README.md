@@ -193,6 +193,25 @@ exactly names an existing file is always taken literally, so a file called
 A pattern that matches nothing is reported rather than silently doing nothing,
 so a typo does not look like a successful run with no work to do.
 
+#### Companion file pre-flight
+
+When `additionalSources` uses the `${fileName}` placeholder, every companion is
+checked for existence before anything is muxed. Episodes whose companions are
+missing are named and skipped; the rest of the batch is muxed normally.
+
+```
+*** 2 file(s) will be skipped: companion files are missing
+      ${fileName}[Studio].mka  (missing for 2 file(s))
+        Show.S01E13.mkv, Show.S01E14.mkv
+```
+
+A dub or subtitle release covering only part of a season is routine. Without the
+check that surfaces as an mkvmerge failure partway through a long batch; with it,
+the gaps are visible before the first mux and the complete episodes still get
+processed. Those episodes would have failed anyway, so nothing is lost by
+skipping them — this never aborts the run. If every episode is blocked, the run
+says so instead of printing a bare `Done`.
+
 `--identify` prints the track table you need in order to write the config — id,
 type, codec, language, default/forced flags and track name for every track of
 every matching file:
