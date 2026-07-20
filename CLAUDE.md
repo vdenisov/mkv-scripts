@@ -34,7 +34,7 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 34 tests
+groovy src/test/run_tests.groovy              # Run all 37 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```
@@ -46,11 +46,15 @@ Harness conventions worth knowing before adding a case:
 - `cfg(...)` builds a `config.yaml` string from a map; omitting `trackOrder` omits the key entirely, which is how the derivation tests work.
 - Tests that need `mkvpropedit` check `mkvpropeditExe` and skip themselves (printing a note) when it is absent, rather than failing.
 - The wrapper smoke test needs a bare `groovy` on `PATH`, which the harness itself does not require — it skips when that is unavailable. On Windows the probe must go through `cmd`, since `groovy` is a `.bat` that `ProcessBuilder` cannot launch directly.
+- `withStubServer(routes, body)` stands up a JDK `com.sun.net.httpserver.HttpServer` on a random port and serves canned JSON per path. This is how `fetch_episodes.groovy` is tested offline: the script's hidden `--base-url` option points it at the stub. Deterministic and dependency-free, so it runs everywhere including CI.
+- The live TheMovieDB contract test (`37_…`) is skip-guarded on a key in `TMDB_API_KEY` or `src/apikey.txt`, following the same pattern as `mkvpropeditExe`. It runs automatically on the dev machine and skips elsewhere — including on PRs from forks, where GitHub withholds secrets by design.
 - When a test fails, the harness prints the captured output of the script under test; this is what makes subprocess failures diagnosable in CI logs.
+
+**Groovy's File I/O is charset-asymmetric**, which drives the `episodes.txt` contract: the no-arg *reader* (`readLines()`, `getText()`) runs `CharsetToolkit` auto-detection and picks UTF-8 for UTF-8 content, but the no-arg *writer* (`withWriter {}`) uses the platform default and silently writes `?` for every unmappable character. So `fetch_episodes.groovy` writes with an explicit `'UTF-8'` (lossy otherwise on a non-UTF-8 default), while `rename.groovy` reads with no charset on purpose — forcing UTF-8 there would break a hand-assembled `episodes.txt` and gain nothing over auto-detection. Verified by probe under `-Dfile.encoding=ISO-8859-1`; note that reproducing this needs `-Dgroovy.source.encoding=UTF-8` too, or Groovy compiles the script's own string literals with the hostile charset and every result is self-consistently wrong.
 
 ## External dependencies (must be installed separately)
 
-- **Groovy 3 or newer** (Java 11+) — the runtime for all scripts; CI tests both Groovy 3 and Groovy 5, plus a weekly leg against the newest MKVToolNix release
+- **Groovy 3 or newer** (Java 11+) — the runtime for all scripts; CI tests both Groovy 3 and Groovy 5, plus a weekly leg against the newest MKVToolNix release and a weekly-only job for the live TheMovieDB contract test (reads a `TMDB_API_KEY` repo secret; never runs on push or PR, so network flakiness cannot redden the badge)
 - **MKVToolNix** — `mkvmerge` is auto-detected from PATH (optionally overridden via `general.mkvmergeExe` in `config.yaml`); `mkvpropedit` is invoked from PATH by `filename_to_title.groovy` and `propedit.groovy`
 - JVM library dependencies are declared via `@Grab` annotations inside each script and fetched automatically on first run
 

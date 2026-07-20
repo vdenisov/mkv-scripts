@@ -6,6 +6,11 @@ import picocli.CommandLine
 import picocli.groovy.PicocliScript2
 import org.apache.commons.io.FileUtils
 import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+import com.sun.net.httpserver.HttpServer
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 
 @CommandLine.Command(name='run_tests', mixinStandardHelpOptions=true,
                      description='Run the mkv.groovy test suite')
@@ -108,9 +113,12 @@ def writeConfig = { File workDir, String yaml ->
     new File(workDir, 'config.yaml').text = yaml
 }
 
-/** Write episodes.txt into workDir, one title per line. */
+/** Write episodes.txt into workDir, one title per line.
+ *  UTF-8 explicitly, matching what fetch_episodes.groovy writes and what
+ *  rename.groovy reads — the harness must not depend on the platform default
+ *  any more than the scripts do. */
 def writeEpisodes = { File workDir, List<String> titles ->
-    new File(workDir, 'episodes.txt').text = titles.join('\n') + '\n'
+    new File(workDir, 'episodes.txt').setText(titles.join('\n') + '\n', 'UTF-8')
 }
 
 /** Copy test.mkv into workDir under the given name. */
@@ -138,6 +146,26 @@ def runMkvGroovy = { File workDir, List extraArgs = [] ->
 /** Find the single output MKV in workDir/<destDir>. */
 def findOutput = { File workDir, String destDir = 'mkv' ->
     new File(workDir, destDir).listFiles()?.find { it.name.endsWith('.mkv') }
+}
+
+/** Serve a canned JSON response per path on a random local port for the duration
+ *  of the body, which receives the base URL. Lets fetch_episodes.groovy be tested
+ *  offline and deterministically via its --base-url seam; the JDK's own
+ *  HttpServer keeps this dependency-free.
+ *
+ *  routes: path (e.g. '/3/tv/2260') -> JSON string. Unknown paths return 404. */
+def withStubServer = { Map<String, String> routes, Closure body ->
+    def server = HttpServer.create(new InetSocketAddress('127.0.0.1', 0), 0)
+    server.createContext('/') { exchange ->     // query string is not under test
+        def json  = routes[exchange.requestURI.path]
+        def bytes = (json ?: '{"status_message":"stub: no route"}').getBytes('UTF-8')
+        exchange.responseHeaders.add('Content-Type', 'application/json; charset=utf-8')
+        exchange.sendResponseHeaders(json ? 200 : 404, bytes.length)
+        exchange.responseBody.withStream { it.write(bytes) }
+    }
+    server.start()
+    try { body("http://127.0.0.1:${server.address.port}".toString()) }
+    finally { server.stop(0) }
 }
 
 def check = { boolean cond, String msg ->
@@ -875,6 +903,154 @@ runTest('34_rename_dry_run') { workDir ->
     check(new File(workDir, 'Show.s01e01.mkv').exists(), 'first original untouched')
     check(new File(workDir, 'Show.s01e02.mkv').exists(), 'second original untouched')
     check(!new File(workDir, 'My Show - S01E01 - First Episode.mkv').exists(), 'nothing renamed')
+}
+
+// ─── 35. fetch_episodes against a local stub: parsing and name sanitising ────
+// Offline and deterministic, so it runs everywhere including CI. The character
+// filtering only matters on Windows and CI is Linux-only, which is exactly why
+// it is asserted here rather than left to manual testing.
+runTest('35_fetch_episodes_stub') { workDir ->
+    def rawTitles = [
+        'Plain Title',
+        'Slash/Colon: Question?',
+        'Quote"Star*Pipe|',
+        'Back\\slash<gt>',
+        'Trailing dots...',
+        'Trailing space   '
+    ]
+
+    def routes = [
+        '/3/tv/2260'         : JsonOutput.toJson([name: 'Stub Show', first_air_date: '2006-07-07']),
+        '/3/tv/2260/season/1': JsonOutput.toJson([episodes: rawTitles.collect { [name: it] }])
+    ]
+
+    withStubServer(routes) { String baseUrl ->
+        def (code, out) = runScript('fetch_episodes.groovy', workDir,
+                                    ['--api-key', 'stub', '--show-id', '2260',
+                                     '--season', '1', '--base-url', baseUrl])
+        checkEquals(code, 0, 'exit code')
+        check(out.contains('Stub Show'), 'prints the show name')
+        check(out.contains('2006'), 'prints the first-air year')
+
+        def lines = new File(workDir, 'episodes.txt').readLines('UTF-8')
+        checkEquals(lines, [
+            'Plain Title',
+            'SlashColon Question',
+            'QuoteStarPipe',
+            'Backslashgt',
+            'Trailing dots',
+            'Trailing space'
+        ], 'episodes.txt contents')
+
+        // Every character Windows rejects in a file name must be gone
+        check(!lines.any { it =~ /[\\\/:*?"<>|]/ }, 'no characters invalid on Windows survive')
+        check(!lines.any { it ==~ /.*[. ]$/ },      'no trailing dots or spaces survive')
+    }
+}
+
+// ─── 36. fetch_episodes stub: a failing request reports, never stack-traces ──
+runTest('36_fetch_episodes_stub_error') { workDir ->
+    withStubServer([:]) { String baseUrl ->
+        def (code, out) = runScript('fetch_episodes.groovy', workDir,
+                                    ['--api-key', 'stub', '--show-id', '2260',
+                                     '--season', '1', '--base-url', baseUrl])
+        check(code != 0, 'exits non-zero')
+        check(out.contains('404'), 'reports the HTTP status')
+        check(!out.contains('at fetch_episodes'), 'no stack trace in the output')
+        check(!new File(workDir, 'episodes.txt').exists(), 'no episodes.txt written on failure')
+    }
+}
+
+// ─── 37. fetch_episodes live contract test against TheMovieDB ────────────────
+// Answers a different question from test 35: not "does our code work" but "has
+// the API changed shape". Needs network and a key, so it skips when either is
+// missing — that is also what makes it safe on fork PRs, where GitHub withholds
+// secrets. Assertions are deliberately loose: TheMovieDB may legitimately edit
+// episode titles, so asserting on them would produce failures that are not bugs.
+runTest('37_fetch_episodes_live_contract') { workDir ->
+    def key = System.getenv('TMDB_API_KEY')
+    if (!key) {
+        def keyFile = new File(repoRoot, 'src/apikey.txt')
+        if (keyFile.exists()) key = keyFile.readLines().find { it.trim() }?.trim()
+    }
+    if (!key) {
+        println "  (skipped: no TheMovieDB API key in TMDB_API_KEY or src/apikey.txt)"
+        return
+    }
+
+    // Show 2260 is "H2O: Just Add Water", a finished Australian series, so its
+    // season 1 episode count is not going to move.
+    def (code, out) = runScript('fetch_episodes.groovy', workDir,
+                                ['--api-key', key, '--show-id', '2260', '--season', '1'])
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(out.contains('H2O'), 'show name came back')
+
+    def lines = new File(workDir, 'episodes.txt').readLines('UTF-8').findAll { it.trim() }
+    check(lines.size() >= 20, "plausible episode count, got ${lines.size()}")
+}
+
+// ─── 38. non-ASCII titles survive fetch_episodes -> episodes.txt -> rename ───
+// episodes.txt is a contract between two scripts: fetch_episodes.groovy writes
+// it, rename.groovy reads it back. The write side names UTF-8 explicitly because
+// Groovy's no-arg writer would use the platform default and silently replace
+// every unmappable character with '?'; the read side deliberately does not, so
+// Groovy's charset auto-detection can still cope with a hand-made episodes.txt.
+//
+// What this covers: the whole path end to end with non-ASCII, which nothing else
+// does. What it does NOT do is guard the writer's explicit charset — under a
+// UTF-8 default (both CI legs, and any modern JDK) the no-arg writer produces
+// identical bytes, so reverting that fix would not turn this test red. Do not
+// mistake it for a regression guard on the encoding itself; forcing a hostile
+// default to get one also needs -Dgroovy.source.encoding=UTF-8, or the Cyrillic
+// literals below are mangled consistently with everything else and it passes
+// for the wrong reason.
+runTest('38_non_ascii_titles_round_trip') { workDir ->
+    def titles = ['Волчица и пряности', 'Тест: второй эпизод']
+
+    def routes = [
+        '/3/tv/2260'         : JsonOutput.toJson([name: 'Спайс и Волк', first_air_date: '2008-01-09']),
+        '/3/tv/2260/season/1': JsonOutput.toJson([episodes: titles.collect { [name: it] }])
+    ]
+
+    stageInput(workDir, 'Show.s01e01.mkv')
+    stageInput(workDir, 'Show.s01e02.mkv')
+
+    withStubServer(routes) { String baseUrl ->
+        def (fetchCode, fetchOut) = runScript('fetch_episodes.groovy', workDir,
+                                              ['--api-key', 'stub', '--show-id', '2260',
+                                               '--season', '1', '--base-url', baseUrl])
+        checkEquals(fetchCode, 0, "fetch exit code (output was:\n$fetchOut\n)")
+    }
+
+    // The bytes on disk must be valid UTF-8 regardless of what the platform
+    // default happens to be, so decode strictly rather than trusting readLines
+    def epFile = new File(workDir, 'episodes.txt')
+    def decoder = StandardCharsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+    def decoded
+    try {
+        decoded = decoder.decode(ByteBuffer.wrap(epFile.bytes)).toString()
+    } catch (Exception e) {
+        throw new AssertionError("episodes.txt is not valid UTF-8: ${e}")
+    }
+
+    checkEquals(decoded.readLines(), ['Волчица и пряности', 'Тест второй эпизод'],
+                'episodes.txt decoded as UTF-8')
+
+    // Show name stays ASCII deliberately: a Cyrillic argument would test
+    // subprocess argument encoding instead, and a failure there would look
+    // identical to the episodes.txt regression this test exists to catch.
+    def (code, out) = runScript('rename.groovy', workDir, ['My Show'])
+    checkEquals(code, 0, "rename exit code (output was:\n$out\n)")
+
+    def names = workDir.listFiles().collect { it.name } as Set
+    check('My Show - S01E01 - Волчица и пряности.mkv' in names,
+          "first file renamed with its Cyrillic title; got ${names}")
+    check('My Show - S01E02 - Тест второй эпизод.mkv' in names,
+          "second file renamed with its Cyrillic title; got ${names}")
+    check(!names.any { it.contains('?') || it.contains('�') },
+          "no replacement characters in the renamed files; got ${names}")
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────

@@ -118,10 +118,20 @@ root:
 groovy src/fetch_episodes.groovy --show-id 2260 --season 1 [--api-key KEY]
 ```
 
-If `--api-key` is not supplied, the key is read from `apikey.txt` in the current
-directory. Episode names are written to `episodes.txt`, one per line, with
-characters invalid in Windows file names stripped. Endpoint examples live in
-`src/themoviedb.http`.
+If `--api-key` is not supplied, the key is read from `apikey.txt` — the current
+directory first, then the copy next to the script, so the key does not have to be
+copied into every media directory. Episode names are written to `episodes.txt`,
+one per line, with characters invalid in Windows file names stripped, along with
+any trailing dots and spaces (which Windows also rejects). Endpoint examples live
+in `src/themoviedb.http`.
+
+Failures are reported rather than thrown: a bad key, an unknown show or a
+nonexistent season prints TheMovieDB's own message and exits non-zero.
+
+`episodes.txt` is written as UTF-8 explicitly, so non-Latin titles survive
+regardless of the JVM's default charset. `rename.groovy` reads it back without
+forcing a charset, which lets Groovy auto-detect UTF-8 while still handling an
+`episodes.txt` assembled by hand in an editor that saved it as something else.
 
 ### rename.groovy
 
