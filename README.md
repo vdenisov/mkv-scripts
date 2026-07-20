@@ -121,6 +121,7 @@ characters invalid in Windows file names stripped. Endpoint examples live in
 
 ```
 groovy src/rename.groovy "Show Name" [episodeOffset]
+groovy src/rename.groovy "Show Name" --dry-run    # preview, rename nothing
 ```
 
 Renames every media/subtitle file whose name contains an `sXXeYY` pattern to
@@ -128,6 +129,15 @@ Renames every media/subtitle file whose name contains an `sXXeYY` pattern to
 A trailing `[suffix]` in the original name (e.g. a dub studio tag) is preserved.
 `episodeOffset` (default 1) maps the first line of `episodes.txt` to an episode
 number.
+
+The whole batch is checked before anything is renamed. If any file has no
+`sXXeYY` pattern, has no matching title in `episodes.txt`, or would overwrite an
+existing file or collide with another rename, every problem is listed and
+nothing is touched. This matters because renaming removes the `sXXeYY` pattern
+that ties a file to its episode, so a rename that failed halfway would have to
+be untangled by hand.
+
+`--dry-run` prints the planned `old -> new` pairs and exits.
 
 ### mux.groovy
 

@@ -15,7 +15,7 @@ groovy src/mux.groovy                                       # Main muxer — rea
 groovy src/mux.groovy --identify                            # Print a track table per file, mux nothing
 groovy src/mux.groovy --dry-run                             # Print the mkvmerge command per file, run nothing
 groovy src/fetch_episodes.groovy --show-id 2260 --season 1  # Fetch episode names from TheMovieDB
-groovy src/rename.groovy "Show Name" [episodeOffset]        # Batch-rename files
+groovy src/rename.groovy "Show Name" [episodeOffset]        # Batch-rename files (--dry-run to preview)
 groovy src/filename_to_title.groovy                         # Set MKV segment title/track name from filename
 groovy src/fix_srt.groovy                                   # Validate and reformat SRT files
 groovy src/to_utf8.groovy                                   # Convert SRT from windows-1251 → UTF-8

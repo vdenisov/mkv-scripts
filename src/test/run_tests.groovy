@@ -108,6 +108,11 @@ def writeConfig = { File workDir, String yaml ->
     new File(workDir, 'config.yaml').text = yaml
 }
 
+/** Write episodes.txt into workDir, one title per line. */
+def writeEpisodes = { File workDir, List<String> titles ->
+    new File(workDir, 'episodes.txt').text = titles.join('\n') + '\n'
+}
+
 /** Copy test.mkv into workDir under the given name. */
 def stageInput = { File workDir, String name = 'test.mkv' ->
     def dest = new File(workDir, name)
@@ -832,6 +837,41 @@ runTest('32_propedit_passthrough') { workDir ->
 
     checkEquals(identify(input).container.get('properties').title, 'SmokeTest',
                 'title set via passthrough')
+}
+
+// ─── 33. rename aborts before touching anything when a title is missing ──────
+// The data-loss guard: renaming destroys the sXXeYY pattern that links a file
+// to its episode, so a partial rename is expensive to untangle by hand.
+runTest('33_rename_missing_episode_aborts') { workDir ->
+    stageInput(workDir, 'Show.s01e01.mkv')
+    stageInput(workDir, 'Show.s01e02.mkv')
+    writeEpisodes(workDir, ['First Episode'])   // nothing for episode 02
+
+    def (code, out) = runScript('rename.groovy', workDir, ['My Show'])
+    check(code != 0, 'exits non-zero')
+    check(out.contains('Refusing to rename'), 'announces that nothing was renamed')
+    check(out.contains('02'), 'names the offending episode')
+
+    // Both originals must survive untouched, and nothing may contain 'null'
+    check(new File(workDir, 'Show.s01e01.mkv').exists(), 'first original still present')
+    check(new File(workDir, 'Show.s01e02.mkv').exists(), 'second original still present')
+    check(!workDir.listFiles().any { it.name.contains('null') }, "no file named with a literal 'null'")
+}
+
+// ─── 34. rename --dry-run previews without renaming ──────────────────────────
+runTest('34_rename_dry_run') { workDir ->
+    stageInput(workDir, 'Show.s01e01.mkv')
+    stageInput(workDir, 'Show.s01e02.mkv')
+    writeEpisodes(workDir, ['First Episode', 'Second Episode'])
+
+    def (code, out) = runScript('rename.groovy', workDir, ['My Show', '1', '--dry-run'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains("My Show - S01E01 - First Episode.mkv"),  'previews the first rename')
+    check(out.contains("My Show - S01E02 - Second Episode.mkv"), 'previews the second rename')
+
+    check(new File(workDir, 'Show.s01e01.mkv').exists(), 'first original untouched')
+    check(new File(workDir, 'Show.s01e02.mkv').exists(), 'second original untouched')
+    check(!new File(workDir, 'My Show - S01E01 - First Episode.mkv').exists(), 'nothing renamed')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
