@@ -57,6 +57,7 @@ assert mkvgroovy.exists() : "mkv.groovy not found at $mkvgroovy"
 
 def failures = []
 def passes   = []
+def lastMkvOutput = null
 
 /** Run a command list; return [exitCode, stdout+stderr combined]. */
 def exec = { cmd, File cwd = null ->
@@ -95,11 +96,9 @@ def extractTrack = { File src, File destFile, String trackType, int trackId ->
     assert (code == 0 || code == 1) : "extractTrack failed (exit $code):\n$out"
 }
 
-/** Write config.yaml into workDir/src/config.yaml. */
+/** Write config.yaml into workDir (mkv.groovy reads it from the CWD). */
 def writeConfig = { File workDir, String yaml ->
-    def cfgDir = new File(workDir, 'src')
-    cfgDir.mkdirs()
-    new File(cfgDir, 'config.yaml').text = yaml
+    new File(workDir, 'config.yaml').text = yaml
 }
 
 /** Copy test.mkv into workDir under the given name. */
@@ -109,9 +108,12 @@ def stageInput = { File workDir, String name = 'test.mkv' ->
     dest
 }
 
-/** Run mkv.groovy from workDir; return [exitCode, output]. */
+/** Run mkv.groovy from workDir; return [exitCode, output].
+ *  The output is also kept for diagnostics if the test fails. */
 def runMkvGroovy = { File workDir ->
-    exec([groovyExe, mkvgroovy.absolutePath], workDir)
+    def result = exec([groovyExe, mkvgroovy.absolutePath], workDir)
+    lastMkvOutput = result[1]
+    result
 }
 
 /** Find the single output MKV in workDir/<destDir>. */
@@ -134,6 +136,7 @@ def runTest = { String name, Closure body ->
     def workDir = new File(workRoot, name.replaceAll(/[^a-zA-Z0-9_-]/, '_'))
     if (workDir.exists()) try { FileUtils.deleteDirectory(workDir) } catch (ignored) {}
     workDir.mkdirs()
+    lastMkvOutput = null
 
     try {
         body(workDir)
@@ -142,6 +145,11 @@ def runTest = { String name, Closure body ->
     } catch (Throwable t) {
         failures << [name: name, msg: t.message ?: t.toString()]
         println "[FAIL] $name: ${t.message ?: t}"
+        if (lastMkvOutput) {
+            println "  --- mkv.groovy output ---"
+            lastMkvOutput.eachLine { println "  $it" }
+            println "  -------------------------"
+        }
     } finally {
         if (!keepWork && !failures.find { it.name == name }) {
             try { FileUtils.deleteDirectory(workDir) } catch (ignored) {}

@@ -16,7 +16,8 @@ current directory, and is small enough to read and adapt in a few minutes.
 ## Prerequisites
 
 - **Java 11+** and **Groovy 3 or newer** — CI runs the test suite on both the
-  minimum (Groovy 3 / JDK 11) and a current setup (Groovy 5 / JDK 21).
+  minimum (Groovy 3 / JDK 11) and a current setup (Groovy 5 / JDK 21), and a
+  weekly run additionally tests against the newest MKVToolNix release.
 - **MKVToolNix** — `mkvmerge` is auto-detected from `PATH` (with a fallback to the
   default Windows install location); you can also set an explicit path in
   `config.yaml`. `mkvpropedit` (on `PATH`) is needed only for
@@ -38,19 +39,24 @@ flowchart TD
     EP --> REN["renamer.groovy"]
     REN --> FILES["Show - SxxEyy - Title.ext"]
     FILES --> MKV["mkv.groovy"]
-    CFG["src/config.yaml"] --> MKV
+    CFG["config.yaml"] --> MKV
     MKV --> MERGE[mkvmerge] --> OUT["muxed MKV in destinationDir"]
     OUT --> POST["post-processing utilities"]
 ```
 
 ## Scripts
 
-All scripts are run from the directory containing your media files (except
-`mkv.groovy` and the tests, which are run from the repo root):
+All scripts operate on the current working directory — run them from the
+directory containing your media files (for a repo checkout that means
+`groovy <path-to-repo>/src/<script>.groovy`). `mkv.groovy` looks for
+`config.yaml` in the current directory first — a per-show config dropped next
+to the media files — and falls back to the `config.yaml` next to the script
+(`src/config.yaml` in this repo). Only the test suite is run from the repo
+root:
 
 | Script | Purpose |
 |--------|---------|
-| `mkv.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `src/config.yaml`. |
+| `mkv.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. |
 | `fetch_episodes.groovy` | Fetches episode names for a show/season from TheMovieDB and writes `episodes.txt`. |
 | `renamer.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
@@ -88,7 +94,8 @@ number.
 groovy src/mkv.groovy
 ```
 
-Reads `src/config.yaml`, discovers all files in the current directory matching
+Reads `config.yaml` (current directory first, then the copy next to the
+script), discovers all files in the current directory matching
 `allowedExtensions`, and runs `mkvmerge` for each one. Output goes to
 `destinationDir`. If a file fails, the error is printed and processing continues
 with the next file. See [Configuration](#configuration) below.
@@ -111,7 +118,8 @@ groovy src/find_unused_fonts.groovy   # report unreferenced fonts in fonts/
 
 ## Configuration
 
-`mkv.groovy` is driven by a YAML configuration file (`src/config.yaml`).
+`mkv.groovy` is driven by a YAML configuration file (`config.yaml`, located as
+described above); the repo ships a working example at `src/config.yaml`.
 
 ### General settings
 

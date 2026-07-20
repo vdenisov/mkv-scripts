@@ -3,8 +3,14 @@
 import org.apache.commons.io.FilenameUtils
 import org.yaml.snakeyaml.Yaml
 
-// Load configuration from YAML file
-def configFile = new File("src/config.yaml")
+// Load configuration from YAML file: the current directory takes precedence
+// (per-show config next to the media files), falling back to the config
+// shipped next to this script
+def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+def configFile = [new File("config.yaml"), new File(scriptDir, "config.yaml")].find { it.exists() }
+if (configFile == null) {
+    throw new RuntimeException("config.yaml not found in the current directory or next to mkv.groovy")
+}
 def config = new Yaml().load(configFile.text)
 
 // Locate an MKVToolNix executable: try PATH first, then the Windows default install location
@@ -32,7 +38,18 @@ def mkvmergeExe = (config.general.containsKey('mkvmergeExe') && config.general.m
     : findMkvTool('mkvmerge')
 
 // Hardcoded values
-def uiLanguage = "en"
+// mkvmerge's UI language codes changed across versions ('en_US' up to at least
+// v82, 'en' in later versions), so probe which spelling this mkvmerge accepts
+// and omit the option entirely if neither works
+def uiLanguage = ["en", "en_US"].find { lang ->
+    try {
+        def proc = [mkvmergeExe, "--ui-language", lang, "--version"].execute()
+        proc.waitFor()
+        proc.exitValue() == 0
+    } catch (ignored) {
+        false
+    }
+}
 def priority = "lower"
 
 def fileName = null
@@ -40,15 +57,16 @@ def extension = null
 
 // Build command line based on configuration; closure so it captures script-scope locals
 def buildCommandLine = {
-    def commandLine = [
-        mkvmergeExe,
-        "--ui-language",
-        uiLanguage,
+    def commandLine = [mkvmergeExe] as ArrayList
+    if (uiLanguage != null) {
+        commandLine.addAll(["--ui-language", uiLanguage])
+    }
+    commandLine.addAll([
         "--priority",
         priority,
         "--output",
         "${destinationDir}/${-> fileName}.mkv", // Output file name
-    ] as ArrayList
+    ])
 
     // Auto-generate track selection options from track IDs
     def hasAudioTracks = config.mainSource.containsKey('audioTracks') && !config.mainSource.audioTracks.isEmpty()

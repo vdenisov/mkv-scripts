@@ -8,10 +8,10 @@ A Groovy toolkit for automating MKV video file workflows — primarily for TV sh
 
 ## Running scripts
 
-All scripts are run with Groovy from the repo root:
+All scripts operate on the current working directory — in practice the directory containing the media files. `mkv.groovy` looks for `config.yaml` in the CWD first (per-show config next to the media files), then falls back to the `config.yaml` next to the script itself. Only the test suite is run from the repo root:
 
 ```bash
-groovy src/mkv.groovy                                          # Main muxer — reads src/config.yaml
+groovy src/mkv.groovy                                          # Main muxer — reads config.yaml (CWD, then script dir)
 groovy src/fetch_episodes.groovy --show-id 2260 --season 1    # Fetch episode names from TheMovieDB
 groovy src/renamer.groovy "Show Name" [episodeOffset]         # Batch-rename files
 groovy src/filename_to_title.groovy                            # Set MKV segment title/track name from filename
@@ -37,7 +37,7 @@ Tests use `src/test/test.mkv` as the input fixture (1 video, 6 audio, 10 subtitl
 
 ## External dependencies (must be installed separately)
 
-- **Groovy 3 or newer** (Java 11+) — the runtime for all scripts; CI tests both Groovy 3 and Groovy 5
+- **Groovy 3 or newer** (Java 11+) — the runtime for all scripts; CI tests both Groovy 3 and Groovy 5, plus a weekly leg against the newest MKVToolNix release
 - **MKVToolNix** — `mkvmerge` is auto-detected from PATH (optionally overridden via `general.mkvmergeExe` in `config.yaml`); `mkvpropedit` is invoked from PATH by `filename_to_title.groovy` and `prop.groovy`
 - JVM library dependencies are declared via `@Grab` annotations inside each script and fetched automatically on first run
 
@@ -49,7 +49,7 @@ Scripts form a sequential pipeline:
 TheMovieDB API
   └─ fetch_episodes.groovy → src/episodes.txt
        └─ renamer.groovy   → renamed files (Show - SxxEyy - Title.ext)
-            └─ mkv.groovy (+ src/config.yaml) → mkvmerge → output MKV in destinationDir/
+            └─ mkv.groovy (+ config.yaml) → mkvmerge → output MKV in destinationDir/
                  └─ post-processing utilities:
                       filename_to_title.groovy  (embed metadata)
                       prop.groovy               (fix track flags)
@@ -60,7 +60,7 @@ TheMovieDB API
 
 ## `mkv.groovy` internals
 
-`mkv.groovy` is the core script. It reads `src/config.yaml`, discovers all files in the current directory matching `allowedExtensions`, and for each file constructs and executes an `mkvmerge` command.
+`mkv.groovy` is the core script. It reads `config.yaml` (CWD first, then the script's own directory), discovers all files in the current directory matching `allowedExtensions`, and for each file constructs and executes an `mkvmerge` command.
 
 **Critical pattern:** all helpers in `mkv.groovy` must be closures (`def foo = { ... }`), not methods (`def foo() { ... }`). Groovy methods on a Script class cannot access `def`-declared local variables from the script body — closures can because they capture their enclosing scope. `buildCommandLine` is defined as a closure for this reason.
 
@@ -68,7 +68,7 @@ Lazy GString closures (`${-> fileName}`) are used throughout `buildCommandLine` 
 
 `additionalSources` entries support a `${fileName}` placeholder that resolves to the base filename of the current main source file, enabling per-episode companion files like `${fileName}[Studio].mka`.
 
-## Configuration (src/config.yaml)
+## Configuration (config.yaml)
 
 | Field | Purpose |
 |-------|---------|

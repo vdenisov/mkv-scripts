@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly, so the 'upstream' leg picks up new MKVToolNix releases and
+    # catches regressions without any commits to this repo
+    - cron: "0 6 * * 1"
 
 jobs:
   test:
@@ -16,10 +20,16 @@ jobs:
           # Minimum supported environment
           - groovy: "3.0.25"
             java: "11"
+            mkvtoolnix: distro
           # Current environment
           - groovy: "5.0.6"
             java: "21"
-    name: Groovy ${{ matrix.groovy }} / JDK ${{ matrix.java }}
+            mkvtoolnix: distro
+          # Newest MKVToolNix from the upstream apt repo — regression canary
+          - groovy: "5.0.6"
+            java: "21"
+            mkvtoolnix: upstream
+    name: Groovy ${{ matrix.groovy }} / JDK ${{ matrix.java }} / mkvtoolnix ${{ matrix.mkvtoolnix }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,10 +38,16 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
 
-      - name: Install MKVToolNix
+      - name: Install MKVToolNix (${{ matrix.mkvtoolnix }})
         run: |
+          if [ "${{ matrix.mkvtoolnix }}" = "upstream" ]; then
+            sudo mkdir -p /etc/apt/keyrings
+            sudo wget -q -O /etc/apt/keyrings/gpg-pub-moritzbunkus.gpg https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/gpg-pub-moritzbunkus.gpg] https://mkvtoolnix.download/ubuntu/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/mkvtoolnix.download.list
+          fi
           sudo apt-get update
           sudo apt-get install -y mkvtoolnix
+          mkvmerge --version
 
       - name: Cache Groovy distribution
         uses: actions/cache@v4
