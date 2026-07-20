@@ -101,7 +101,7 @@ root:
 | `fetch_episodes.groovy` | Fetches episode names for a show/season from TheMovieDB and writes `episodes.txt`. |
 | `rename.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
-| `propedit.groovy` | Batch-runs `mkvpropedit` over every MKV in the current directory — fix any property (track names, forced/default flags, …) without a full remux. Adjust the command line in the script to your needs; as committed, it clears the forced flag on the second audio track. |
+| `propedit.groovy` | Batch-runs `mkvpropedit` over every MKV in the current directory, passing your arguments through — fix any property (track names, forced/default flags, …) without a full remux. |
 | `to_utf8.groovy` | Converts `.srt` files from Windows-1251 to UTF-8 (writes `<name>.utf8.srt`). |
 | `fix_srt.groovy` | Converts subtitles in a non-standard timing format into valid SRT (writes `<name>.srt.fixed`). |
 | `find_unused_fonts.groovy` | Lists font files in `fonts/` that are not referenced by any `.ass` subtitle in the current directory. |
@@ -163,6 +163,27 @@ committing to a long mux. Both flags leave the filesystem untouched — not even
 
 The printed command is meant for reading, not for pasting: mkvmerge's `(` and
 `)` source-grouping tokens are not shell-safe as written.
+
+### propedit.groovy
+
+```
+groovy src/propedit.groovy --edit track:a2 --set flag-forced=0
+```
+
+Runs `mkvpropedit` against every `.mkv` in the current directory, passing all
+arguments through verbatim with the file name inserted first. Anything
+`mkvpropedit` accepts works without editing the script:
+
+```
+groovy src/propedit.groovy --edit track:s1 --set flag-default=1
+groovy src/propedit.groovy --edit info --set title="My Show"
+groovy src/propedit.groovy --add-track-statistics-tags
+```
+
+Run with no arguments to print usage; nothing is modified. `-h`/`--help` is
+handled locally only when it is the sole argument — in any other combination it
+is passed through to `mkvpropedit`. Unlike `mux.groovy`, this script exits
+non-zero if any file failed, so it can be used from a shell script.
 
 ### Post-processing utilities
 

@@ -51,6 +51,12 @@ def findMkvTool = { String name ->
 
 def mkvmergeExe = mkvmergeExeOverride ?: findMkvTool('mkvmerge')
 
+// Optional: propedit tests skip themselves when this is absent
+def mkvpropeditExe = null
+try {
+    mkvpropeditExe = findMkvTool('mkvpropedit')
+} catch (ignored) {}
+
 assert testMkv.exists()   : "test.mkv not found at $testMkv"
 assert mkvgroovy.exists() : "mux.groovy not found at $mkvgroovy"
 
@@ -109,12 +115,19 @@ def stageInput = { File workDir, String name = 'test.mkv' ->
     dest
 }
 
-/** Run mux.groovy from workDir; return [exitCode, output].
+/** Run any script from the repo's src/ in workDir; return [exitCode, output].
  *  The output is also kept for diagnostics if the test fails. */
-def runMkvGroovy = { File workDir, List extraArgs = [] ->
-    def result = exec([groovyExe, mkvgroovy.absolutePath] + extraArgs, workDir)
+def runScript = { String scriptName, File workDir, List extraArgs = [] ->
+    def script = new File(repoRoot, "src/${scriptName}")
+    assert script.exists() : "script not found at $script"
+    def result = exec([groovyExe, script.absolutePath] + extraArgs, workDir)
     lastMkvOutput = result[1]
     result
+}
+
+/** Run mux.groovy from workDir; return [exitCode, output]. */
+def runMkvGroovy = { File workDir, List extraArgs = [] ->
+    runScript('mux.groovy', workDir, extraArgs)
 }
 
 /** Find the single output MKV in workDir/<destDir>. */
@@ -789,6 +802,36 @@ runTest('30_track_order_missing_id_warns') { workDir ->
     def outFile = findOutput(workDir)
     check(outFile != null && outFile.exists(), 'output still produced')
     checkEquals(identify(outFile).tracks.count { it.type == 'audio' }, 2, 'both audio tracks muxed')
+}
+
+// ─── 31. propedit with no arguments changes nothing ──────────────────────────
+runTest('31_propedit_no_args_is_noop') { workDir ->
+    def input = stageInput(workDir)
+    def sizeBefore = input.length()
+    def mtimeBefore = input.lastModified()
+
+    def (code, out) = runScript('propedit.groovy', workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Usage'), 'prints usage')
+
+    checkEquals(input.length(), sizeBefore, 'file size unchanged')
+    checkEquals(input.lastModified(), mtimeBefore, 'file mtime unchanged')
+}
+
+// ─── 32. propedit passes its arguments through to mkvpropedit ────────────────
+runTest('32_propedit_passthrough') { workDir ->
+    if (!mkvpropeditExe) {
+        println "  (skipped: mkvpropedit not available)"
+        return
+    }
+
+    def input = stageInput(workDir)
+    def (code, out) = runScript('propedit.groovy', workDir,
+                                ['--edit', 'info', '--set', 'title=SmokeTest'])
+    checkEquals(code, 0, 'exit code')
+
+    checkEquals(identify(input).container.get('properties').title, 'SmokeTest',
+                'title set via passthrough')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────

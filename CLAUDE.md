@@ -27,7 +27,9 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 
 `fetch_episodes.groovy` reads the API key from `src/apikey.txt` if `--api-key` is not supplied.
 
-`propedit.groovy` is a generic wrapper that runs `mkvpropedit` in a loop over all MKV files in the current directory — it can fix any property (track names, forced/default flags, etc.) without remuxing. The command line inside the script is expected to be adjusted per task; as committed, it clears the forced flag on the second audio track.
+`propedit.groovy` is a generic wrapper that runs `mkvpropedit` in a loop over all MKV files in the current directory — it can fix any property (track names, forced/default flags, etc.) without remuxing. All arguments are passed through verbatim, with the file name inserted first; no source editing is needed per task. It deliberately does not use picocli, which would try to parse the passthrough options as its own. `-h`/`--help` is intercepted only when it is the sole argument.
+
+**Exit-code asymmetry:** `propedit.groovy` exits 1 if any file failed, so it is usable from a shell script. `mux.groovy` deliberately keeps its continue-on-error, always-exit-0 behaviour (a test depends on it, and a partially-successful batch mux is a normal outcome there).
 
 ## Running tests
 
