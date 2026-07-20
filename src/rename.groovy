@@ -72,6 +72,15 @@ duplicates.each { name, entries ->
 if (problems) {
     println "*** Refusing to rename anything, ${problems.size()} problem(s) found:"
     problems.each { println "  - ${it}" }
+
+    // Still show what the rest of the batch would have done, so the scope of
+    // what is blocked is visible rather than having to be inferred
+    if (plan) {
+        println()
+        println "*** The other ${plan.size()} file(s) would have been renamed:"
+        plan.each { println "  '${it.file.name}' -> '${it.newName}'" }
+    }
+
     System.exit(1)
 }
 

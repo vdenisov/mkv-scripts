@@ -852,6 +852,9 @@ runTest('33_rename_missing_episode_aborts') { workDir ->
     check(out.contains('Refusing to rename'), 'announces that nothing was renamed')
     check(out.contains('02'), 'names the offending episode')
 
+    // The valid part of the batch is still shown, so the blocked scope is visible
+    check(out.contains('My Show - S01E01 - First Episode.mkv'), 'previews the renames that would have happened')
+
     // Both originals must survive untouched, and nothing may contain 'null'
     check(new File(workDir, 'Show.s01e01.mkv').exists(), 'first original still present')
     check(new File(workDir, 'Show.s01e02.mkv').exists(), 'second original still present')
