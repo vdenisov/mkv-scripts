@@ -13,6 +13,12 @@ dubs and subtitles, and naming everything consistently.
 It is deliberately narrow in scope — each script does one thing, operates on the
 current directory, and is small enough to read and adapt in a few minutes.
 
+```
+mkv-mux --identify        # what tracks does this file have?
+mkv-mux --dry-run         # what would be muxed, exactly?
+mkv-mux                   # do it
+```
+
 ## Prerequisites
 
 - **Java 11+** and **Groovy 3 or newer** — CI runs the test suite on both the
@@ -394,7 +400,9 @@ groovy src/test/run_tests.groovy --filter 01 --keep
 groovy src/test/run_tests.groovy --mkvmerge-exe /usr/bin/mkvmerge
 ```
 
-`mkvmerge` is auto-detected from PATH; use `--mkvmerge-exe` to override.
+`mkvmerge` is auto-detected from PATH; use `--mkvmerge-exe` to override. Cases
+that need `mkvpropedit`, or a bare `groovy` on `PATH` for the wrapper smoke
+test, skip themselves with a printed note when those are unavailable.
 
 ## License
 

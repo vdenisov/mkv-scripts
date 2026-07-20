@@ -34,12 +34,19 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 26 tests
+groovy src/test/run_tests.groovy              # Run all 34 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```
 
-Tests use `src/test/test.mkv` as the input fixture (1 video, 6 audio, 10 subtitle tracks). The harness stages files into `src/test/work/<case>/`, writes a tailored `config.yaml`, runs `mux.groovy` as a subprocess, and asserts on the output via `mkvmerge -J`.
+Tests use `src/test/test.mkv` as the input fixture: track 0 video (und), 1–3 audio (jpn/eng/rus), 4–6 subtitles (eng/rus-forced/jpn). The harness stages files into `src/test/work/<case>/`, writes a tailored `config.yaml`, runs the script under test as a subprocess via the `runScript` closure, and asserts on the output via `mkvmerge -J`.
+
+Harness conventions worth knowing before adding a case:
+
+- `cfg(...)` builds a `config.yaml` string from a map; omitting `trackOrder` omits the key entirely, which is how the derivation tests work.
+- Tests that need `mkvpropedit` check `mkvpropeditExe` and skip themselves (printing a note) when it is absent, rather than failing.
+- The wrapper smoke test needs a bare `groovy` on `PATH`, which the harness itself does not require — it skips when that is unavailable. On Windows the probe must go through `cmd`, since `groovy` is a `.bat` that `ProcessBuilder` cannot launch directly.
+- When a test fails, the harness prints the captured output of the script under test; this is what makes subprocess failures diagnosable in CI logs.
 
 ## External dependencies (must be installed separately)
 
