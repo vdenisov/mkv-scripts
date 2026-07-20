@@ -1,2 +1,11 @@
 * text=auto eol=lf
 *.mkv binary
+
+# Extension-less POSIX wrappers must stay LF even on Windows checkouts.
+# This rule must come BEFORE the *.bat rule below: gitattributes is
+# last-match-wins, and bin/mkv-* also matches bin/mkv-mux.bat
+bin/mkv-* text eol=lf
+
+# Batch files misbehave with LF line endings
+*.bat text eol=crlf
+*.cmd text eol=crlf

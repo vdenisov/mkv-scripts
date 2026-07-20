@@ -26,7 +26,8 @@ import groovy.json.JsonSlurper
 def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
 def repoRoot  = scriptDir.parentFile.parentFile          // …/mkv-script
 def testMkv   = new File(scriptDir, 'test.mkv')
-def mkvgroovy = new File(repoRoot, 'src/mkv.groovy')
+def mkvgroovy = new File(repoRoot, 'src/mux.groovy')
+def binDir    = new File(repoRoot, 'bin')
 def workRoot  = new File(scriptDir, 'work')
 
 def isWindows = System.getProperty('os.name').toLowerCase().contains('win')
@@ -50,8 +51,14 @@ def findMkvTool = { String name ->
 
 def mkvmergeExe = mkvmergeExeOverride ?: findMkvTool('mkvmerge')
 
+// Optional: propedit tests skip themselves when this is absent
+def mkvpropeditExe = null
+try {
+    mkvpropeditExe = findMkvTool('mkvpropedit')
+} catch (ignored) {}
+
 assert testMkv.exists()   : "test.mkv not found at $testMkv"
-assert mkvgroovy.exists() : "mkv.groovy not found at $mkvgroovy"
+assert mkvgroovy.exists() : "mux.groovy not found at $mkvgroovy"
 
 // ─── Helpers (closures so they capture script-scope variables) ───────────────
 
@@ -101,6 +108,11 @@ def writeConfig = { File workDir, String yaml ->
     new File(workDir, 'config.yaml').text = yaml
 }
 
+/** Write episodes.txt into workDir, one title per line. */
+def writeEpisodes = { File workDir, List<String> titles ->
+    new File(workDir, 'episodes.txt').text = titles.join('\n') + '\n'
+}
+
 /** Copy test.mkv into workDir under the given name. */
 def stageInput = { File workDir, String name = 'test.mkv' ->
     def dest = new File(workDir, name)
@@ -108,12 +120,19 @@ def stageInput = { File workDir, String name = 'test.mkv' ->
     dest
 }
 
-/** Run mkv.groovy from workDir; return [exitCode, output].
+/** Run any script from the repo's src/ in workDir; return [exitCode, output].
  *  The output is also kept for diagnostics if the test fails. */
-def runMkvGroovy = { File workDir ->
-    def result = exec([groovyExe, mkvgroovy.absolutePath], workDir)
+def runScript = { String scriptName, File workDir, List extraArgs = [] ->
+    def script = new File(repoRoot, "src/${scriptName}")
+    assert script.exists() : "script not found at $script"
+    def result = exec([groovyExe, script.absolutePath] + extraArgs, workDir)
     lastMkvOutput = result[1]
     result
+}
+
+/** Run mux.groovy from workDir; return [exitCode, output]. */
+def runMkvGroovy = { File workDir, List extraArgs = [] ->
+    runScript('mux.groovy', workDir, extraArgs)
 }
 
 /** Find the single output MKV in workDir/<destDir>. */
@@ -210,7 +229,10 @@ def cfg = { Map opts = [:] ->
         opts.mainAdditionalOptions.each { sb << "    - \"$it\"\n" }
     }
 
-    sb << "trackOrder: \"${opts.trackOrder ?: '0:0'}\"\n"
+    // Omit the key entirely when not supplied, so tests can exercise derivation
+    if (opts.containsKey('trackOrder') && opts.trackOrder != null) {
+        sb << "trackOrder: \"${opts.trackOrder}\"\n"
+    }
 
     if (opts.additionalSources) {
         sb << "additionalSources:\n"
@@ -573,16 +595,15 @@ runTest('22_invalid_track_id') { workDir ->
     check(out.contains('*** Error:'), 'error reported for bad track id')
 }
 
-// ─── 23. Stale trackOrder with nonexistent ID: silently ignored ──────────────
+// ─── 23. Stale trackOrder with nonexistent ID: warned about, still muxes ─────
 // mkvmerge silently discards track IDs in --track-order that don't correspond
-// to any muxed track, exits 0, and still produces a valid output. This is the
-// "known sharp edge" documented in README — the stale entry is harmless but
-// undetected at the config level.
+// to any muxed track, exits 0, and still produces a valid output. mux.groovy
+// warns about this rather than failing, so the config error is visible.
 runTest('23_stale_track_order') { workDir ->
     stageInput(workDir)
     writeConfig(workDir, cfg(
         audioTracks: [[id:2, language:'en', title:'English', default:true]],
-        trackOrder: '0:0,0:2,0:999'    // 999 doesn't exist — ignored silently
+        trackOrder: '0:0,0:2,0:999'    // 999 doesn't exist — mkvmerge ignores it silently
     ))
     def (code, out) = runMkvGroovy(workDir)
     def outFile = findOutput(workDir)
@@ -590,6 +611,9 @@ runTest('23_stale_track_order') { workDir ->
     check(outFile != null && outFile.exists(), 'output file still produced')
     def tracks = identify(outFile).tracks
     checkEquals(tracks.count { it.type == 'audio' }, 1, 'audio track still present')
+
+    check(out.contains('references track IDs not configured'), 'warns about the unknown ID')
+    check(out.contains('0:999'), 'warning names the offending ID')
 }
 
 // ─── 24. Realistic season-episode golden test ─────────────────────────────────
@@ -635,6 +659,222 @@ runTest('24_realistic_season_episode') { workDir ->
 
     def langs = tracks.collect { it.get('properties').language }
     check(!langs.contains('rus'), 'no Russian tracks in output')
+}
+
+// ─── 25. bin/ wrappers exist and point at real scripts ───────────────────────
+// 16 hand-written files; this catches typos for the price of a directory listing.
+runTest('25_wrappers_exist_and_resolve') { workDir ->
+    def wrappers = [
+        'mkv-mux'                : 'mux.groovy',
+        'mkv-rename'             : 'rename.groovy',
+        'mkv-propedit'           : 'propedit.groovy',
+        'mkv-fix-srt'            : 'fix_srt.groovy',
+        'mkv-fetch-episodes'     : 'fetch_episodes.groovy',
+        'mkv-filename-to-title'  : 'filename_to_title.groovy',
+        'mkv-to-utf8'            : 'to_utf8.groovy',
+        'mkv-find-unused-fonts'  : 'find_unused_fonts.groovy',
+    ]
+
+    wrappers.each { name, target ->
+        def sh  = new File(binDir, name)
+        def bat = new File(binDir, "${name}.bat")
+
+        check(sh.exists(),  "$name exists")
+        check(bat.exists(), "${name}.bat exists")
+        check(sh.length()  > 0, "$name is not empty")
+        check(bat.length() > 0, "${name}.bat is not empty")
+
+        // Both wrappers must name the same script, and it must be a real file
+        check(sh.text.contains("../src/${target}"),  "$name references src/$target")
+        check(bat.text.contains("..\\src\\${target}"), "${name}.bat references src\\$target")
+        check(new File(repoRoot, "src/${target}").exists(), "src/$target exists (referenced by $name)")
+    }
+}
+
+// ─── 26. Wrapper actually runs ────────────────────────────────────────────────
+// Bare invocation in a directory with a config but no media files: the script
+// should start up, find nothing to do, and exit cleanly. Deliberately avoids
+// any CLI flags so this test does not depend on later features.
+runTest('26_wrapper_smoke') { workDir ->
+    // The wrappers hardcode a bare 'groovy'; the harness may be using groovy.home.
+    // On Windows 'groovy' is a .bat, which ProcessBuilder cannot launch directly —
+    // probe through cmd, the same way the wrapper itself is invoked below.
+    def groovyOnPath = { ->
+        try {
+            def probe = isWindows ? ['cmd', '/c', 'groovy', '--version'] : ['groovy', '--version']
+            def p = probe.execute()
+            p.waitFor()
+            return p.exitValue() == 0
+        } catch (ignored) {
+            return false
+        }
+    }()
+
+    if (!groovyOnPath) {
+        println "  (skipped: 'groovy' is not on PATH; wrappers require it)"
+        return
+    }
+
+    writeConfig(workDir, cfg(
+        audioTracks: [[id: 2, language: 'en', title: 'English', default: true]],
+        trackOrder: '0:0,0:2'
+    ))
+
+    def cmd = isWindows
+        ? ['cmd', '/c', new File(binDir, 'mkv-mux.bat').absolutePath]
+        : [new File(binDir, 'mkv-mux').absolutePath]
+
+    def (code, out) = exec(cmd, workDir)
+    checkEquals(code, 0, 'wrapper exit code')
+    check(out.contains('*** Done'), 'wrapper ran mux.groovy to completion')
+}
+
+// ─── 27. --dry-run prints the command and touches nothing ────────────────────
+runTest('27_dry_run_produces_no_output') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id: 2, language: 'en', title: 'English', default: true]],
+        trackOrder: '0:0,0:2'
+    ))
+
+    def (code, out) = runMkvGroovy(workDir, ['--dry-run'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Dry run'), 'announces dry run')
+    check(out.contains('--track-order'), 'prints the built command line')
+
+    // Nothing may be written — not even the destination directory
+    check(!new File(workDir, 'mkv').exists(), 'destination dir not created')
+}
+
+// ─── 28. --identify lists tracks without muxing ──────────────────────────────
+// Assertions are deliberately loose: column formatting is expected to drift.
+runTest('28_identify_lists_tracks') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id: 2, language: 'en', title: 'English', default: true]],
+        trackOrder: '0:0,0:2'
+    ))
+
+    def (code, out) = runMkvGroovy(workDir, ['--identify'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('video'),     'lists the video track')
+    check(out.contains('subtitles'), 'lists subtitle tracks')
+    check(out.contains('jpn'),       'lists track languages')
+    check(!new File(workDir, 'mkv').exists(), 'destination dir not created')
+}
+
+// ─── 29. trackOrder omitted: derived from the configured tracks ──────────────
+runTest('29_derived_track_order') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [
+            [id: 1, language: 'ja', title: 'Japanese', default: true],
+            [id: 2, language: 'en', title: 'English',  default: false]
+        ],
+        subtitleTracks: [[id: 4, language: 'en', title: 'English', default: true]]
+        // trackOrder deliberately omitted
+    ))
+
+    def (code, out) = runMkvGroovy(workDir)
+    check(out.contains('using derived order: 0:0,0:1,0:2,0:4'), 'reports the derived order')
+
+    def tracks = identify(findOutput(workDir)).tracks
+    def audio  = tracks.findAll { it.type == 'audio' }
+    def subs   = tracks.findAll { it.type == 'subtitles' }
+
+    checkEquals(tracks[0].type, 'video', 'video first')
+    checkEquals(audio[0].get('properties').language, 'jpn', 'audio in listed order (jpn first)')
+    checkEquals(audio[1].get('properties').language, 'eng', 'audio in listed order (eng second)')
+    checkEquals(subs.size(), 1, 'subtitle count')
+}
+
+// ─── 30. trackOrder omitting a configured track: warned about ────────────────
+runTest('30_track_order_missing_id_warns') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [
+            [id: 1, language: 'ja', title: 'Japanese', default: true],
+            [id: 2, language: 'en', title: 'English',  default: false]
+        ],
+        trackOrder: '0:0,0:1'    // 0:2 is configured but not ordered
+    ))
+
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('omits configured track IDs'), 'warns about the omitted ID')
+    check(out.contains('0:2'), 'warning names the omitted ID')
+
+    def outFile = findOutput(workDir)
+    check(outFile != null && outFile.exists(), 'output still produced')
+    checkEquals(identify(outFile).tracks.count { it.type == 'audio' }, 2, 'both audio tracks muxed')
+}
+
+// ─── 31. propedit with no arguments changes nothing ──────────────────────────
+runTest('31_propedit_no_args_is_noop') { workDir ->
+    def input = stageInput(workDir)
+    def sizeBefore = input.length()
+    def mtimeBefore = input.lastModified()
+
+    def (code, out) = runScript('propedit.groovy', workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Usage'), 'prints usage')
+
+    checkEquals(input.length(), sizeBefore, 'file size unchanged')
+    checkEquals(input.lastModified(), mtimeBefore, 'file mtime unchanged')
+}
+
+// ─── 32. propedit passes its arguments through to mkvpropedit ────────────────
+runTest('32_propedit_passthrough') { workDir ->
+    if (!mkvpropeditExe) {
+        println "  (skipped: mkvpropedit not available)"
+        return
+    }
+
+    def input = stageInput(workDir)
+    def (code, out) = runScript('propedit.groovy', workDir,
+                                ['--edit', 'info', '--set', 'title=SmokeTest'])
+    checkEquals(code, 0, 'exit code')
+
+    checkEquals(identify(input).container.get('properties').title, 'SmokeTest',
+                'title set via passthrough')
+}
+
+// ─── 33. rename aborts before touching anything when a title is missing ──────
+// The data-loss guard: renaming destroys the sXXeYY pattern that links a file
+// to its episode, so a partial rename is expensive to untangle by hand.
+runTest('33_rename_missing_episode_aborts') { workDir ->
+    stageInput(workDir, 'Show.s01e01.mkv')
+    stageInput(workDir, 'Show.s01e02.mkv')
+    writeEpisodes(workDir, ['First Episode'])   // nothing for episode 02
+
+    def (code, out) = runScript('rename.groovy', workDir, ['My Show'])
+    check(code != 0, 'exits non-zero')
+    check(out.contains('Refusing to rename'), 'announces that nothing was renamed')
+    check(out.contains('02'), 'names the offending episode')
+
+    // The valid part of the batch is still shown, so the blocked scope is visible
+    check(out.contains('My Show - S01E01 - First Episode.mkv'), 'previews the renames that would have happened')
+
+    // Both originals must survive untouched, and nothing may contain 'null'
+    check(new File(workDir, 'Show.s01e01.mkv').exists(), 'first original still present')
+    check(new File(workDir, 'Show.s01e02.mkv').exists(), 'second original still present')
+    check(!workDir.listFiles().any { it.name.contains('null') }, "no file named with a literal 'null'")
+}
+
+// ─── 34. rename --dry-run previews without renaming ──────────────────────────
+runTest('34_rename_dry_run') { workDir ->
+    stageInput(workDir, 'Show.s01e01.mkv')
+    stageInput(workDir, 'Show.s01e02.mkv')
+    writeEpisodes(workDir, ['First Episode', 'Second Episode'])
+
+    def (code, out) = runScript('rename.groovy', workDir, ['My Show', '1', '--dry-run'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains("My Show - S01E01 - First Episode.mkv"),  'previews the first rename')
+    check(out.contains("My Show - S01E02 - Second Episode.mkv"), 'previews the second rename')
+
+    check(new File(workDir, 'Show.s01e01.mkv').exists(), 'first original untouched')
+    check(new File(workDir, 'Show.s01e02.mkv').exists(), 'second original untouched')
+    check(!new File(workDir, 'My Show - S01E01 - First Episode.mkv').exists(), 'nothing renamed')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────

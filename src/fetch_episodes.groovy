@@ -30,8 +30,21 @@ import static groovyx.net.http.ContentTypes.JSON
 @CommandLine.Option(names = ["-s", "--season"], description = "The season number", required = true)
 @Field String season
 
+// Resolve the API key file the same way mux.groovy resolves config.yaml: the
+// current directory takes precedence, falling back to the copy next to this
+// script, so the key does not have to be copied into every media directory
 if (apiKey == null || "" == apiKey) {
-    apiKey = new File("apikey.txt").readLines()[0].trim()
+    def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+    def keyFile = [new File("apikey.txt"), new File(scriptDir, "apikey.txt")].find { it.exists() }
+    if (keyFile == null) {
+        System.err.println "No API key: pass --api-key, or create apikey.txt in the current directory or next to fetch_episodes.groovy"
+        System.exit(2)
+    }
+    apiKey = keyFile.readLines()[0].trim()
+    if (!apiKey) {
+        System.err.println "API key file is empty: ${keyFile.absolutePath}"
+        System.exit(2)
+    }
 }
 
 println "Fetching episodes from TheMovieDB..."

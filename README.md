@@ -13,6 +13,12 @@ dubs and subtitles, and naming everything consistently.
 It is deliberately narrow in scope — each script does one thing, operates on the
 current directory, and is small enough to read and adapt in a few minutes.
 
+```
+mkv-mux --identify        # what tracks does this file have?
+mkv-mux --dry-run         # what would be muxed, exactly?
+mkv-mux                   # do it
+```
+
 ## Prerequisites
 
 - **Java 11+** and **Groovy 3 or newer** — CI runs the test suite on both the
@@ -21,7 +27,7 @@ current directory, and is small enough to read and adapt in a few minutes.
 - **MKVToolNix** — `mkvmerge` is auto-detected from `PATH` (with a fallback to the
   default Windows install location); you can also set an explicit path in
   `config.yaml`. `mkvpropedit` (on `PATH`) is needed only for
-  `filename_to_title.groovy` and `prop.groovy`.
+  `filename_to_title.groovy` and `propedit.groovy`.
 - Network access on first run — dependencies are declared via `@Grab` and
   downloaded automatically.
 - A [TheMovieDB](https://www.themoviedb.org/) API key — only for
@@ -29,26 +35,67 @@ current directory, and is small enough to read and adapt in a few minutes.
 
 ## Pipeline overview
 
-The scripts form a loose pipeline. Only `mkv.groovy` is essential; everything
+The scripts form a loose pipeline. Only `mux.groovy` is essential; everything
 else is optional tooling around it.
 
 ```mermaid
 flowchart TD
     TMDB[TheMovieDB API] --> FETCH["fetch_episodes.groovy"]
     FETCH --> EP["episodes.txt"]
-    EP --> REN["renamer.groovy"]
+    EP --> REN["rename.groovy"]
     REN --> FILES["Show - SxxEyy - Title.ext"]
-    FILES --> MKV["mkv.groovy"]
+    FILES --> MKV["mux.groovy"]
     CFG["config.yaml"] --> MKV
     MKV --> MERGE[mkvmerge] --> OUT["muxed MKV in destinationDir"]
     OUT --> POST["post-processing utilities"]
 ```
 
+## Command wrappers
+
+`bin/` contains a thin wrapper per script — a `.bat` for Windows and an
+extension-less shell script for Linux/macOS — so you can run everything from
+whatever directory your media files are in, without copying the scripts around.
+
+Add `bin/` to your `PATH` once:
+
+```powershell
+# Windows (persists for the current user)
+setx PATH "%PATH%;C:\path\to\mkv-scripts\bin"
+```
+
+```bash
+# Linux / macOS (add to your shell profile)
+export PATH="$PATH:/path/to/mkv-scripts/bin"
+```
+
+Then, from any directory:
+
+```
+mkv-mux                              # instead of: groovy .../src/mux.groovy
+mkv-rename "Show Name"
+mkv-propedit --edit track:a2 --set flag-forced=0
+```
+
+| Command | Script |
+|---------|--------|
+| `mkv-mux` | `mux.groovy` |
+| `mkv-fetch-episodes` | `fetch_episodes.groovy` |
+| `mkv-rename` | `rename.groovy` |
+| `mkv-filename-to-title` | `filename_to_title.groovy` |
+| `mkv-propedit` | `propedit.groovy` |
+| `mkv-to-utf8` | `to_utf8.groovy` |
+| `mkv-fix-srt` | `fix_srt.groovy` |
+| `mkv-find-unused-fonts` | `find_unused_fonts.groovy` |
+
+Each wrapper locates its script relative to its own location, so `bin/` can live
+anywhere — but add the directory to `PATH` rather than symlinking individual
+wrappers elsewhere, as the shell wrappers do not resolve symlinks.
+
 ## Scripts
 
 All scripts operate on the current working directory — run them from the
-directory containing your media files (for a repo checkout that means
-`groovy <path-to-repo>/src/<script>.groovy`). `mkv.groovy` looks for
+directory containing your media files (via the `bin/` wrappers above, or
+`groovy <path-to-repo>/src/<script>.groovy`). `mux.groovy` looks for
 `config.yaml` in the current directory first — a per-show config dropped next
 to the media files — and falls back to the `config.yaml` next to the script
 (`src/config.yaml` in this repo). Only the test suite is run from the repo
@@ -56,13 +103,13 @@ root:
 
 | Script | Purpose |
 |--------|---------|
-| `mkv.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. |
+| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--dry-run` prints commands without running them. |
 | `fetch_episodes.groovy` | Fetches episode names for a show/season from TheMovieDB and writes `episodes.txt`. |
-| `renamer.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
+| `rename.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
-| `prop.groovy` | Batch-runs `mkvpropedit` over every MKV in the current directory — fix any property (track names, forced/default flags, …) without a full remux. Adjust the command line in the script to your needs; as committed, it clears the forced flag on the second audio track. |
+| `propedit.groovy` | Batch-runs `mkvpropedit` over every MKV in the current directory, passing your arguments through — fix any property (track names, forced/default flags, …) without a full remux. |
 | `to_utf8.groovy` | Converts `.srt` files from Windows-1251 to UTF-8 (writes `<name>.utf8.srt`). |
-| `srtfixer.groovy` | Converts subtitles in a non-standard timing format into valid SRT (writes `<name>.srt.fixed`). |
+| `fix_srt.groovy` | Converts subtitles in a non-standard timing format into valid SRT (writes `<name>.srt.fixed`). |
 | `find_unused_fonts.groovy` | Lists font files in `fonts/` that are not referenced by any `.ass` subtitle in the current directory. |
 
 ### fetch_episodes.groovy
@@ -76,10 +123,11 @@ directory. Episode names are written to `episodes.txt`, one per line, with
 characters invalid in Windows file names stripped. Endpoint examples live in
 `src/themoviedb.http`.
 
-### renamer.groovy
+### rename.groovy
 
 ```
-groovy src/renamer.groovy "Show Name" [episodeOffset]
+groovy src/rename.groovy "Show Name" [episodeOffset]
+groovy src/rename.groovy "Show Name" --dry-run    # preview, rename nothing
 ```
 
 Renames every media/subtitle file whose name contains an `sXXeYY` pattern to
@@ -88,10 +136,21 @@ A trailing `[suffix]` in the original name (e.g. a dub studio tag) is preserved.
 `episodeOffset` (default 1) maps the first line of `episodes.txt` to an episode
 number.
 
-### mkv.groovy
+The whole batch is checked before anything is renamed. If any file has no
+`sXXeYY` pattern, has no matching title in `episodes.txt`, or would overwrite an
+existing file or collide with another rename, every problem is listed and
+nothing is touched. This matters because renaming removes the `sXXeYY` pattern
+that ties a file to its episode, so a rename that failed halfway would have to
+be untangled by hand.
+
+`--dry-run` prints the planned `old -> new` pairs and exits.
+
+### mux.groovy
 
 ```
-groovy src/mkv.groovy
+groovy src/mux.groovy              # mux every matching file
+groovy src/mux.groovy --identify   # list tracks per file, mux nothing
+groovy src/mux.groovy --dry-run    # print the mkvmerge command per file, run nothing
 ```
 
 Reads `config.yaml` (current directory first, then the copy next to the
@@ -100,25 +159,61 @@ script), discovers all files in the current directory matching
 `destinationDir`. If a file fails, the error is printed and processing continues
 with the next file. See [Configuration](#configuration) below.
 
-To discover track IDs in a source file first:
+`--identify` prints the track table you need in order to write the config — id,
+type, codec, language, default/forced flags and track name for every track of
+every matching file:
 
 ```
-mkvmerge -i episode.mkv
+*** Show.S01E01.mkv
+  ID   TYPE       CODEC                  LANG  DEF  FOR  NAME
+  0    video      AVC/H.264/MPEG-4p10    und   no   no   Video
+  1    audio      AAC                    jpn   yes  no   Audio A
+  2    audio      AAC                    eng   no   no   Audio B
+  4    subtitles  SubRip/SRT             eng   yes  no   Subtitle A
 ```
+
+`--dry-run` prints the exact command that would be run, which is the quickest
+way to check track selection and `${fileName}` companion resolution before
+committing to a long mux. Both flags leave the filesystem untouched — not even
+`destinationDir` is created.
+
+The printed command is meant for reading, not for pasting: mkvmerge's `(` and
+`)` source-grouping tokens are not shell-safe as written.
+
+### propedit.groovy
+
+```
+groovy src/propedit.groovy --edit track:a2 --set flag-forced=0
+```
+
+Runs `mkvpropedit` against every `.mkv` in the current directory, passing all
+arguments through verbatim with the file name inserted first. Anything
+`mkvpropedit` accepts works without editing the script:
+
+```
+groovy src/propedit.groovy --edit track:s1 --set flag-default=1
+groovy src/propedit.groovy --edit info --set title="My Show"
+groovy src/propedit.groovy --add-track-statistics-tags
+```
+
+Run with no arguments to print usage; nothing is modified. `-h`/`--help` is
+handled locally only when it is the sole argument — in any other combination it
+is passed through to `mkvpropedit`. Unlike `mux.groovy`, this script exits
+non-zero if any file failed, so it can be used from a shell script.
 
 ### Post-processing utilities
 
 ```
 groovy src/filename_to_title.groovy   # segment title + video track name := file name
-groovy src/prop.groovy                # batch mkvpropedit — fix properties without remuxing
+groovy src/propedit.groovy            # batch mkvpropedit — fix properties without remuxing
 groovy src/to_utf8.groovy             # Windows-1251 SRT → UTF-8
-groovy src/srtfixer.groovy            # repair non-standard SRT timing/markup
+groovy src/fix_srt.groovy             # repair non-standard SRT timing/markup
 groovy src/find_unused_fonts.groovy   # report unreferenced fonts in fonts/
 ```
 
 ## Configuration
 
-`mkv.groovy` is driven by a YAML configuration file (`config.yaml`, located as
+`mux.groovy` is driven by a YAML configuration file (`config.yaml`, located as
 described above); the repo ships a working example at `src/config.yaml`.
 
 ### General settings
@@ -173,13 +268,29 @@ mainSource:
 
 ### Track order
 
-Controls the order of tracks in the output. Each entry is `sourceIndex:trackId`
-where source 0 is the main source. **This string must be kept in sync with the
-track IDs listed above** — a mismatch produces a mkvmerge error.
+Controls the order of tracks in the output. Each entry is `sourceIndex:trackId`,
+where source 0 is the main source.
+
+**`trackOrder` is optional.** When omitted, it is derived from the tracks you
+configured above, in the order you listed them:
+
+1. the video track (`0:0`),
+2. `mainSource.audioTracks`, in listed order,
+3. `mainSource.subtitleTracks`, in listed order,
+4. one entry per `additionalSources` file (`1:0`, `2:0`, …).
+
+For most configs that is exactly what you want, and the derived value is printed
+when the script runs. Set `trackOrder` explicitly only to override it:
 
 ```yaml
 trackOrder: "0:0,0:2,0:1,0:6"
 ```
+
+An explicit `trackOrder` is checked against the configured tracks, and any
+mismatch is reported as a warning — muxing still proceeds. This matters because
+mkvmerge itself **silently ignores** entries that match no muxed track, so a
+stale ID left behind after editing the track lists would otherwise have no
+visible effect at all.
 
 ### Additional sources
 
@@ -207,6 +318,8 @@ additionalSources:
 
 #### Basic configuration with English audio and subtitles
 
+`trackOrder` is omitted here, so it is derived as `0:0,0:1,0:2`:
+
 ```yaml
 mainSource:
   videoTrack:
@@ -221,7 +334,6 @@ mainSource:
       language: "en"
       title: "English"
       default: true
-trackOrder: "0:0,0:1,0:2"
 ```
 
 #### Configuration with multiple audio tracks
@@ -288,7 +400,9 @@ groovy src/test/run_tests.groovy --filter 01 --keep
 groovy src/test/run_tests.groovy --mkvmerge-exe /usr/bin/mkvmerge
 ```
 
-`mkvmerge` is auto-detected from PATH; use `--mkvmerge-exe` to override.
+`mkvmerge` is auto-detected from PATH; use `--mkvmerge-exe` to override. Cases
+that need `mkvpropedit`, or a bare `groovy` on `PATH` for the wrapper smoke
+test, skip themselves with a printed note when those are unavailable.
 
 ## License
 

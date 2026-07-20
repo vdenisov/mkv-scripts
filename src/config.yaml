@@ -48,7 +48,10 @@ mainSource:
   #   - "0:none"
 
 
-# Track order (source:id pairs)
+# Track order (source:id pairs).
+# Optional: omit this line to derive the order from the tracks configured above
+# (video, then audioTracks in listed order, then subtitleTracks, then each
+# additional source). Set it only to override that order.
 trackOrder: "0:0,0:2,0:1,0:6"
 
 # Additional sources
