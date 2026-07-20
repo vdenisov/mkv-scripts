@@ -108,7 +108,7 @@ root:
 | `rename.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
 | `propedit.groovy` | Batch-runs `mkvpropedit` over every MKV in the current directory, passing your arguments through — fix any property (track names, forced/default flags, …) without a full remux. |
-| `to_utf8.groovy` | Converts `.srt` files from Windows-1251 to UTF-8 (writes `<name>.utf8.srt`). |
+| `to_utf8.groovy` | Converts `.srt`/`.ass`/`.ssa`/`.vtt` subtitles to UTF-8 in place, from `--encoding` (default Windows-1251). Skips files that are already UTF-8; `--backup` keeps the originals. |
 | `fix_srt.groovy` | Converts subtitles in a non-standard timing format into valid SRT (writes `<name>.srt.fixed`). |
 | `find_unused_fonts.groovy` | Lists font files in `fonts/` that are not referenced by any `.ass` subtitle in the current directory. |
 
@@ -259,10 +259,46 @@ non-zero if any file failed, so it can be used from a shell script.
 ```
 groovy src/filename_to_title.groovy   # segment title + video track name := file name
 groovy src/propedit.groovy            # batch mkvpropedit — fix properties without remuxing
-groovy src/to_utf8.groovy             # Windows-1251 SRT → UTF-8
+groovy src/to_utf8.groovy             # subtitles → UTF-8, in place
 groovy src/fix_srt.groovy             # repair non-standard SRT timing/markup
 groovy src/find_unused_fonts.groovy   # report unreferenced fonts in fonts/
 ```
+
+#### to_utf8.groovy
+
+```
+groovy src/to_utf8.groovy                          # from windows-1251 (the default)
+groovy src/to_utf8.groovy --encoding windows-1250  # from something else
+groovy src/to_utf8.groovy --backup                 # keep <name>.orig
+groovy src/to_utf8.groovy --dry-run                # report, write nothing
+```
+
+Converts `.srt`, `.ass`, `.ssa` and `.vtt` files in the current directory to
+UTF-8, **in place**. The source encoding defaults to `windows-1251` and is always
+printed, so it is never a silent assumption. The target is always UTF-8 — making
+that configurable would defeat the script's purpose.
+
+Pass `--backup` to keep the original as `<name>.orig`, or `--dry-run` to preview.
+
+Three things make it safe to point at a directory more than once:
+
+- **Files that are already UTF-8 are skipped** — detected by BOM or by decoding
+  cleanly as UTF-8. Pure ASCII lands here too, correctly: it is already valid
+  UTF-8. Double-converting is precisely how a previously fixed file gets ruined.
+- **Decoding is strict.** Java's default decoder *replaces* bytes that are invalid
+  in the source charset, so a wrong `--encoding` would otherwise succeed quietly
+  and produce mojibake. Instead the file is reported and left alone, and the run
+  exits non-zero.
+- **UTF-16 input is refused.** Every byte of a UTF-16 file maps to *something* in
+  a single-byte charset, so a strict decode alone would happily write the
+  mojibake back.
+
+`.sub` is deliberately excluded: the extension is ambiguous between MicroDVD text
+and the binary half of a VobSub `.idx`/`.sub` pair, and rewriting the binary one
+would destroy it.
+
+Line endings are preserved — the file is decoded and re-encoded whole rather than
+line by line, so CRLF subtitles stay CRLF.
 
 ## Configuration
 

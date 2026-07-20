@@ -20,7 +20,7 @@ groovy src/fetch_episodes.groovy --show-id 2260 --season 1  # Fetch episode name
 groovy src/rename.groovy "Show Name" [episodeOffset]        # Batch-rename files (--dry-run to preview)
 groovy src/filename_to_title.groovy                         # Set MKV segment title/track name from filename
 groovy src/fix_srt.groovy                                   # Validate and reformat SRT files
-groovy src/to_utf8.groovy                                   # Convert SRT from windows-1251 → UTF-8
+groovy src/to_utf8.groovy [--encoding CS] [--backup]        # Subtitles → UTF-8 in place (srt/ass/ssa/vtt)
 groovy src/find_unused_fonts.groovy                         # Find unused fonts referenced in ASS subtitles
 groovy src/propedit.groovy                                  # Batch mkvpropedit — fix properties without remuxing
 ```
@@ -31,12 +31,14 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 
 `propedit.groovy` is a generic wrapper that runs `mkvpropedit` in a loop over all MKV files in the current directory — it can fix any property (track names, forced/default flags, etc.) without remuxing. All arguments are passed through verbatim, with the file name inserted first; no source editing is needed per task. It deliberately does not use picocli, which would try to parse the passthrough options as its own. `-h`/`--help` is intercepted only when it is the sole argument.
 
-**Exit-code asymmetry:** `propedit.groovy` exits 1 if any file failed, so it is usable from a shell script. `mux.groovy` deliberately keeps its continue-on-error, always-exit-0 behaviour (a test depends on it, and a partially-successful batch mux is a normal outcome there).
+`to_utf8.groovy` converts `.srt`/`.ass`/`.ssa`/`.vtt` **in place**. It skips input that is already UTF-8 — by BOM or by a clean strict UTF-8 decode, which also covers pure ASCII — so re-running over a directory is a no-op rather than a corruption. Decoding uses `CodingErrorAction.REPORT`, because Java's default decoder silently replaces invalid bytes and a wrong `--encoding` would otherwise produce mojibake that looks like success. UTF-16 input is refused outright: every byte of it maps to something in a single-byte charset, so strict decoding alone would not catch it. `.sub` is excluded on purpose — ambiguous between MicroDVD text and binary VobSub. Content is decoded and re-encoded whole, not line by line, so CRLF survives.
+
+**Exit-code asymmetry:** `propedit.groovy` and `to_utf8.groovy` exit non-zero if any file failed (`to_utf8.groovy` also exits 2 on an unusable `--encoding` name, before touching anything), so both are usable from a shell script. `mux.groovy` deliberately keeps its continue-on-error, always-exit-0 behaviour (a test depends on it, and a partially-successful batch mux is a normal outcome there).
 
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 49 tests
+groovy src/test/run_tests.groovy              # Run all 58 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```

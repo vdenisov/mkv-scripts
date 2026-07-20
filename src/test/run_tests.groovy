@@ -1223,6 +1223,159 @@ runTest('49_all_companions_missing') { workDir ->
     check(!new File(workDir, 'mkv').exists(), 'destination directory not created')
 }
 
+// ─── to_utf8.groovy ──────────────────────────────────────────────────────────
+
+/** Concatenate byte arrays — Groovy has no byte[] + byte[]. */
+def catBytes = { byte[]... parts ->
+    def out = new ByteArrayOutputStream()
+    parts.each { out.write(it) }
+    out.toByteArray()
+}
+
+def UTF8_BOM  = [0xEF, 0xBB, 0xBF] as byte[]
+def UTF16_BOM = [0xFF, 0xFE] as byte[]
+
+/** Write raw bytes into workDir under the given name. */
+def writeBytes = { File workDir, String name, byte[] bytes ->
+    def f = new File(workDir, name)
+    f.bytes = bytes
+    f
+}
+
+def runToUtf8 = { File workDir, List extraArgs = [] ->
+    runScript('to_utf8.groovy', workDir, extraArgs)
+}
+
+// ─── 50. converts windows-1251 in place, keeping the file's line endings ─────
+runTest('50_to_utf8_converts_in_place') { workDir ->
+    def lf   = writeBytes(workDir, 'lf.srt',   'Привет, мир!\n'.getBytes('windows-1251'))
+    def crlf = writeBytes(workDir, 'crlf.srt', 'Привет\r\nмир\r\n'.getBytes('windows-1251'))
+
+    def (code, out) = runToUtf8(workDir)
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(out.contains('windows-1251'), 'states the source encoding it used')
+
+    checkEquals(lf.getText('UTF-8'), 'Привет, мир!\n', 'LF file converted')
+    checkEquals(crlf.getText('UTF-8'), 'Привет\r\nмир\r\n',
+                'CRLF preserved — writing line by line would normalise these')
+}
+
+// ─── 51. already-UTF-8 input is left alone, so a re-run is a no-op ───────────
+// Double-converting is how a previously fixed file gets corrupted, and this is
+// what makes the script safe to point at a directory more than once.
+runTest('51_to_utf8_skips_already_utf8') { workDir ->
+    def plain = writeBytes(workDir, 'plain.srt', 'Привет\n'.getBytes('UTF-8'))
+    def bom   = writeBytes(workDir, 'bom.ass',   catBytes(UTF8_BOM, 'Привет\n'.getBytes('UTF-8')))
+    def ascii = writeBytes(workDir, 'ascii.vtt', 'WEBVTT\n\nplain\n'.getBytes('UTF-8'))
+    def before = [plain, bom, ascii].collectEntries { [it.name, it.bytes.toList()] }
+
+    def (code, out) = runToUtf8(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('3 skipped'), "all three skipped; got:\n$out")
+
+    [plain, bom, ascii].each {
+        checkEquals(it.bytes.toList(), before[it.name], "${it.name} byte-for-byte unchanged")
+    }
+}
+
+// ─── 52. all four text subtitle formats, and .sub left strictly alone ────────
+// .sub is ambiguous: MicroDVD text vs the binary half of a VobSub .idx/.sub
+// pair. Rewriting the binary one would destroy it, so the extension is excluded.
+runTest('52_to_utf8_extension_coverage') { workDir ->
+    ['srt', 'ass', 'ssa', 'vtt'].each {
+        writeBytes(workDir, "sub.${it}", 'Привет\n'.getBytes('windows-1251'))
+    }
+    // A fragment of a real MPEG program stream header, as a VobSub .sub starts
+    def vobsub = writeBytes(workDir, 'movie.sub', [0x00, 0x00, 0x01, 0xBA, 0x44] as byte[])
+    def vobsubBefore = vobsub.bytes.toList()   // capture as read back: Java bytes are signed
+
+    def (code, out) = runToUtf8(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('4 converted'), "all four formats converted; got:\n$out")
+
+    ['srt', 'ass', 'ssa', 'vtt'].each {
+        checkEquals(new File(workDir, "sub.${it}").getText('UTF-8'), 'Привет\n', "sub.${it} converted")
+    }
+    checkEquals(vobsub.bytes.toList(), vobsubBefore, 'VobSub .sub untouched')
+    check(!out.contains('movie.sub'), '.sub is not even considered')
+}
+
+// ─── 53. --encoding selects the source charset; an unknown one aborts ────────
+runTest('53_to_utf8_explicit_encoding') { workDir ->
+    // 0xC8 0x61 0x6A is "Čaj" in windows-1250, and not valid UTF-8
+    def f = writeBytes(workDir, 'cz.srt', [0xC8, 0x61, 0x6A] as byte[])
+
+    def (code, out) = runToUtf8(workDir, ['--encoding', 'windows-1250'])
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    checkEquals(f.getText('UTF-8'), 'Čaj', 'decoded with the charset that was asked for')
+    check(out.contains('windows-1250'), 'names the encoding in use')
+}
+
+// ─── 54. an unusable charset name fails before any file is touched ───────────
+runTest('54_to_utf8_unknown_encoding_aborts') { workDir ->
+    def f = writeBytes(workDir, 'a.srt', 'Привет\n'.getBytes('windows-1251'))
+    def before = f.bytes.toList()
+
+    def (code, out) = runToUtf8(workDir, ['--encoding', 'not-a-charset'])
+    checkEquals(code, 2, 'exits 2 on an unusable charset name')
+    checkEquals(f.bytes.toList(), before, 'nothing was touched')
+}
+
+// ─── 55. bytes invalid in the source charset are refused, not mangled ────────
+// Java's default decoder replaces malformed input with U+FFFD, so a wrong
+// --encoding would otherwise "succeed" and write mojibake. Strict decoding is
+// what turns that into a visible failure.
+runTest('55_to_utf8_strict_decode_refuses') { workDir ->
+    // 0x81 0x20 is a Shift_JIS lead byte followed by an invalid trail byte,
+    // and is not valid UTF-8 either
+    def f = writeBytes(workDir, 'bad.srt', [0x81, 0x20, 0x41] as byte[])
+    def before = f.bytes.toList()
+
+    def (code, out) = runToUtf8(workDir, ['--encoding', 'Shift_JIS'])
+    checkEquals(code, 1, 'exits non-zero so a shell script can react')
+    check(out.contains('not valid Shift_JIS'), 'says why it refused')
+    checkEquals(f.bytes.toList(), before, 'file left exactly as it was')
+}
+
+// ─── 56. --backup keeps the original bytes alongside ─────────────────────────
+runTest('56_to_utf8_backup') { workDir ->
+    def original = 'Привет\n'.getBytes('windows-1251')
+    def f = writeBytes(workDir, 'a.srt', original)
+
+    def (code, out) = runToUtf8(workDir, ['--backup'])
+    checkEquals(code, 0, 'exit code')
+
+    checkEquals(f.getText('UTF-8'), 'Привет\n', 'original converted in place')
+    def orig = new File(workDir, 'a.srt.orig')
+    check(orig.exists(), 'backup written')
+    checkEquals(orig.bytes.toList(), original.toList(), 'backup holds the original bytes')
+}
+
+// ─── 57. --dry-run reports without writing ───────────────────────────────────
+runTest('57_to_utf8_dry_run') { workDir ->
+    def original = 'Привет\n'.getBytes('windows-1251')
+    def f = writeBytes(workDir, 'a.srt', original)
+
+    def (code, out) = runToUtf8(workDir, ['--dry-run'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('would convert'), 'reports the planned conversion')
+    checkEquals(f.bytes.toList(), original.toList(), 'nothing written')
+    check(!new File(workDir, 'a.srt.orig').exists(), 'no backup written either')
+}
+
+// ─── 58. UTF-16 is refused rather than silently mangled ──────────────────────
+// Every byte of a UTF-16 file maps to something in a single-byte charset, so a
+// strict decode alone would "succeed" and write the mojibake back.
+runTest('58_to_utf8_utf16_left_alone') { workDir ->
+    def bytes = catBytes(UTF16_BOM, 'Привет\n'.getBytes('UTF-16LE'))
+    def f = writeBytes(workDir, 'wide.ssa', bytes)
+
+    def (code, out) = runToUtf8(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('UTF-16'), 'says it recognised UTF-16')
+    checkEquals(f.bytes.toList(), bytes.toList(), 'left exactly as it was')
+}
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 println()
