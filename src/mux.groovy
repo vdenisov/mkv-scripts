@@ -16,6 +16,10 @@ import java.nio.file.Paths
                      description = "Mux MKV files from multiple sources using mkvmerge.")
 @PicocliScript2
 
+@CommandLine.Option(names = ["-c", "--config"], paramLabel = "PATH",
+                    description = "Path to the config file (default: config.yaml in the current directory)")
+@Field String configPath = null
+
 @CommandLine.Option(names = ["--identify"],
                     description = "Print a track table for every matching file and exit without muxing")
 @Field boolean identifyOnly = false
@@ -55,13 +59,23 @@ import java.nio.file.Paths
                                       "(default: every file in the current directory)")
 @Field List<String> fileMasks = []
 
-// Load configuration from YAML file: the current directory takes precedence
-// (per-show config next to the media files), falling back to the config
-// shipped next to this script
-def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
-def configFile = [new File("config.yaml"), new File(scriptDir, "config.yaml")].find { it.exists() }
-if (configFile == null) {
-    throw new RuntimeException("config.yaml not found in the current directory or next to mkv.groovy")
+// Config lives with the media: config.yaml in the current directory, or an
+// explicit --config path. There is deliberately no fall-back to a config beside
+// the script — the file shipped there (config.example.yaml) is a template, and
+// silently applying it to whatever directory you are in produced confidently
+// wrong output (its track selections never match). Copy it next to your media,
+// or point --config at your own.
+def configFile = configPath ? new File(configPath) : new File("config.yaml")
+if (!configFile.isFile()) {
+    def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+    if (configPath) {
+        System.err.println "Config file not found: ${configFile.absolutePath}"
+    } else {
+        System.err.println "No config.yaml in the current directory (${new File('.').absoluteFile.parent})."
+        System.err.println "Copy ${new File(scriptDir, 'config.example.yaml').absolutePath} next to your media"
+        System.err.println "and edit it, or pass --config <path>."
+    }
+    System.exit(2)
 }
 def config = new Yaml().load(configFile.text)
 

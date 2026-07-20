@@ -8,10 +8,10 @@ A Groovy toolkit for automating MKV video file workflows — primarily for TV sh
 
 ## Running scripts
 
-All scripts operate on the current working directory — in practice the directory containing the media files. `mux.groovy` looks for `config.yaml` in the CWD first (per-show config next to the media files), then falls back to the `config.yaml` next to the script itself. Only the test suite is run from the repo root:
+All scripts operate on the current working directory — in practice the directory containing the media files. `mux.groovy` reads `config.yaml` from the CWD (per-show config next to the media files) or from an explicit `--config <path>`; there is **no** fallback to a config next to the script. The repo ships `src/config.example.yaml` as a template — it is never auto-loaded, because silently applying a demo config's track selections to an unrelated directory produced confidently wrong output (a wrong `config title` on the `--check` verdict was the giveaway). A missing config is a clean exit-2 error pointing at the template, not a stack trace. Only the test suite is run from the repo root:
 
 ```bash
-groovy src/mux.groovy                                       # Main muxer — reads config.yaml (CWD, then script dir)
+groovy src/mux.groovy                                       # Main muxer — reads config.yaml (CWD) or --config PATH
 groovy src/mux.groovy --identify                            # Print a track table per file, mux nothing
 groovy src/mux.groovy --check                               # Compare track structure across the batch, mux nothing
 groovy src/mux.groovy --dry-run                             # Print the mkvmerge command per file, run nothing
@@ -39,7 +39,7 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 78 tests
+groovy src/test/run_tests.groovy              # Run all 80 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```

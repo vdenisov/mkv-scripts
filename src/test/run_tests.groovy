@@ -1743,6 +1743,31 @@ runTest('78_check_verbose_does_not_mux') { workDir ->
     check(!new File(workDir, 'mkv').exists(), 'no output directory created')
 }
 
+// ─── 79. a missing config.yaml is a clean error, not a stack trace ───────────
+// The script no longer falls back to the example config next to itself, so a
+// media directory with no config gets told what to do rather than silently
+// muxing with unrelated selections.
+runTest('79_missing_config_clean_error') { workDir ->
+    stageInput(workDir, 'E01.mkv')   // media present, but no config.yaml
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 2, 'exits 2 when no config is found')
+    check(out.contains('No config.yaml'), 'explains the problem')
+    check(out.contains('config.example.yaml'), 'points at the shipped template')
+    check(!out.contains('Exception'), 'no stack trace')
+}
+
+// ─── 80. --config points at a config file outside the current directory ──────
+runTest('80_explicit_config_path') { workDir ->
+    stageInput(workDir, 'E01.mkv')
+    def cfgDir = new File(workDir, 'configs'); cfgDir.mkdirs()
+    new File(cfgDir, 'show.yaml').text =
+        cfg(audioTracks: [[id: 1, language: 'ja', title: 'JP', default: true]])
+
+    def (code, out) = runMkvGroovy(workDir, ['--check', '--config', 'configs/show.yaml'])
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(out.contains('Pre-flight check: 1 file'), 'ran the check using the pointed-at config')
+}
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 println()

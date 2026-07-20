@@ -95,11 +95,11 @@ wrappers elsewhere, as the shell wrappers do not resolve symlinks.
 
 All scripts operate on the current working directory — run them from the
 directory containing your media files (via the `bin/` wrappers above, or
-`groovy <path-to-repo>/src/<script>.groovy`). `mux.groovy` looks for
-`config.yaml` in the current directory first — a per-show config dropped next
-to the media files — and falls back to the `config.yaml` next to the script
-(`src/config.yaml` in this repo). Only the test suite is run from the repo
-root:
+`groovy <path-to-repo>/src/<script>.groovy`). `mux.groovy` reads `config.yaml`
+from the current directory — a per-show config dropped next to the media files —
+or from an explicit `--config <path>`. The repo ships `src/config.example.yaml`
+as a template to copy and edit; it is never loaded automatically. Only the test
+suite is run from the repo root:
 
 | Script | Purpose |
 |--------|---------|
@@ -380,8 +380,9 @@ line by line, so CRLF subtitles stay CRLF.
 
 ## Configuration
 
-`mux.groovy` is driven by a YAML configuration file (`config.yaml`, located as
-described above); the repo ships a working example at `src/config.yaml`.
+`mux.groovy` is driven by a YAML configuration file (`config.yaml` in the media
+directory, or `--config <path>`); copy the shipped template
+`src/config.example.yaml` as a starting point.
 
 ### General settings
 
