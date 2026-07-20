@@ -103,7 +103,7 @@ root:
 
 | Script | Purpose |
 |--------|---------|
-| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--dry-run` prints commands without running them. |
+| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--dry-run` prints commands without running them, and file names or globs (plus `--exclude`) narrow the batch. |
 | `fetch_episodes.groovy` | Fetches episode names for a show/season from TheMovieDB and writes `episodes.txt`. |
 | `rename.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
@@ -158,9 +158,11 @@ be untangled by hand.
 ### mux.groovy
 
 ```
-groovy src/mux.groovy              # mux every matching file
-groovy src/mux.groovy --identify   # list tracks per file, mux nothing
-groovy src/mux.groovy --dry-run    # print the mkvmerge command per file, run nothing
+groovy src/mux.groovy                          # mux every matching file
+groovy src/mux.groovy --identify               # list tracks per file, mux nothing
+groovy src/mux.groovy --dry-run                # print the mkvmerge command per file, run nothing
+groovy src/mux.groovy "Show.S01E0[12].mkv"     # only the files matching a pattern
+groovy src/mux.groovy --exclude "*.sample.mkv" # everything except the files matching a pattern
 ```
 
 Reads `config.yaml` (current directory first, then the copy next to the
@@ -168,6 +170,28 @@ script), discovers all files in the current directory matching
 `allowedExtensions`, and runs `mkvmerge` for each one. Output goes to
 `destinationDir`. If a file fails, the error is printed and processing continues
 with the next file. See [Configuration](#configuration) below.
+
+#### Selecting a subset of the files
+
+Positional arguments narrow the batch to the files you name; `--exclude` drops
+files from it. Both accept an exact file name or a glob, both may be repeated,
+and both apply in every mode — including `--identify` and `--dry-run`. With no
+arguments the behaviour is unchanged: every file in the directory.
+
+```
+groovy src/mux.groovy Show.S01E03.mkv                        # one file
+groovy src/mux.groovy Show.S01E01.mkv Show.S01E03.mkv        # several files
+groovy src/mux.groovy "Show.S01E*.mkv" --exclude "*.sample.mkv"
+```
+
+Quote your patterns. Unix shells expand `*.mkv` before the script runs, which
+works, but quoting keeps the behaviour identical to Windows — where `cmd.exe`
+passes the pattern through and the script expands it itself. A pattern that
+exactly names an existing file is always taken literally, so a file called
+`Odd[1].mkv` selects only itself rather than being read as a character class.
+
+A pattern that matches nothing is reported rather than silently doing nothing,
+so a typo does not look like a successful run with no work to do.
 
 `--identify` prints the track table you need in order to write the config — id,
 type, codec, language, default/forced flags and track name for every track of

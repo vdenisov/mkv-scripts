@@ -14,6 +14,8 @@ All scripts operate on the current working directory — in practice the directo
 groovy src/mux.groovy                                       # Main muxer — reads config.yaml (CWD, then script dir)
 groovy src/mux.groovy --identify                            # Print a track table per file, mux nothing
 groovy src/mux.groovy --dry-run                             # Print the mkvmerge command per file, run nothing
+groovy src/mux.groovy "Show.S01E0[12].mkv"                  # Operate on a subset: file names or globs, repeatable
+groovy src/mux.groovy --exclude "*.sample.mkv"              # Skip files matching a pattern, repeatable
 groovy src/fetch_episodes.groovy --show-id 2260 --season 1  # Fetch episode names from TheMovieDB
 groovy src/rename.groovy "Show Name" [episodeOffset]        # Batch-rename files (--dry-run to preview)
 groovy src/filename_to_title.groovy                         # Set MKV segment title/track name from filename
@@ -34,7 +36,7 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 37 tests
+groovy src/test/run_tests.groovy              # Run all 45 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```
@@ -84,6 +86,8 @@ TheMovieDB API
 The script uses picocli via `@PicocliScript2` (like `rename.groovy` and `fetch_episodes.groovy`). Annotations and `@Field` declarations must all precede the first script-body statement; the closure pattern above still applies to everything after them. This combination is verified on both Groovy 3/JDK 11 and Groovy 5/JDK 21 — `@GrabConfig(systemClassLoader = true)` now covers snakeyaml as well, which is the part most likely to break on a JDK change.
 
 **The `properties` trap:** when reading `mkvmerge -J` output, the per-track JSON key `properties` must be accessed as `track.get('properties')`. On Groovy 4+ both `track.properties` and `track['properties']` resolve to the bean properties of the map object itself, silently returning the wrong thing. This applies to `identifyFile` in `mux.groovy` as well as the test harness.
+
+**File masks do their own glob expansion.** Positional `FILE` arguments and `--exclude` patterns filter the file list in all modes. Unix shells expand `*.mkv` before Groovy sees it, but `cmd.exe` passes the literal string through, so `compileMasks` expands patterns itself via `FileSystems.getDefault().getPathMatcher("glob:…")`, matching against the bare file name. A pattern that names an existing file is matched literally instead — otherwise a file called `Odd[1].mkv` could not be selected at all, since as a glob that also matches `Odd1.mkv`. Getting this wrong passes a Linux-only CI and fails on Windows, which is why tests 39–45 pass patterns through `ProcessBuilder` (no shell, so nothing pre-expands them). The file list is also sorted by name now, so batches process in a predictable order.
 
 Lazy GString closures (`${-> fileName}`) are used throughout `buildCommandLine` so that `fileName` and `extension` are evaluated at command execution time, not at closure definition time.
 

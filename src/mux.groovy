@@ -5,6 +5,9 @@ import org.yaml.snakeyaml.Yaml
 import picocli.CommandLine
 import picocli.groovy.PicocliScript2
 
+import java.nio.file.FileSystems
+import java.nio.file.Paths
+
 @Grab('commons-io:commons-io:2.11.0')
 @Grab('org.yaml:snakeyaml:1.30')
 @Grab('info.picocli:picocli-groovy:4.6.3')
@@ -20,6 +23,15 @@ import picocli.groovy.PicocliScript2
 @CommandLine.Option(names = ["-n", "--dry-run"],
                     description = "Print the mkvmerge command line for every matching file without executing it")
 @Field boolean dryRun = false
+
+@CommandLine.Option(names = ["-x", "--exclude"], paramLabel = "PATTERN",
+                    description = "File name or glob pattern to skip; may be given more than once")
+@Field List<String> excludeMasks = []
+
+@CommandLine.Parameters(index = "0..*", arity = "0..*", paramLabel = "FILE",
+                        description = "File names or glob patterns to process; may be given more than once " +
+                                      "(default: every file in the current directory)")
+@Field List<String> fileMasks = []
 
 // Load configuration from YAML file: the current directory takes precedence
 // (per-show config next to the media files), falling back to the config
@@ -321,8 +333,46 @@ def buildCommandLine = {
 
 def currentDir = new File(".")
 
-//Read files first to be able to write to the same directory
-def files = currentDir.listFiles({ it.isFile() } as FileFilter) as List<File>
+// Unix shells expand "*.mkv" before the script ever sees it, but cmd.exe passes
+// the literal string through, so the expansion has to happen here to behave the
+// same on both. A pattern that names an existing file is taken literally — that
+// is the only way to select a file whose own name contains glob metacharacters,
+// e.g. "Show.S01E0[1].mkv". Everything else is a glob, matched against the bare
+// file name so a pattern never has to account for the leading "./".
+def compileMasks = { List<String> patterns ->
+    patterns.collect { pattern ->
+        if (new File(pattern).isFile()) {
+            def literal = new File(pattern).name
+            return { File candidate -> candidate.name == literal }
+        }
+        def matcher = FileSystems.getDefault().getPathMatcher("glob:" + pattern.replace('\\', '/'))
+        return { File candidate -> matcher.matches(Paths.get(candidate.name)) }
+    }
+}
+
+def includeMatchers = compileMasks(fileMasks)
+def excludeMatchers = compileMasks(excludeMasks)
+
+// Read files first to be able to write to the same directory. Sorted by name so
+// that a batch is processed in a predictable order rather than whatever order
+// the filesystem happens to return.
+def files = ((currentDir.listFiles({ it.isFile() } as FileFilter) as List<File>) ?: []).sort { it.name }
+
+if (includeMatchers) {
+    files = files.findAll { file -> includeMatchers.any { it(file) } }
+}
+if (excludeMatchers) {
+    files = files.findAll { file -> !excludeMatchers.any { it(file) } }
+}
+
+// A mask that matches nothing must say so. Falling through to a bare "Done"
+// after a typo'd pattern looks identical to a successful run that had no work.
+if ((fileMasks || excludeMasks) && !files) {
+    println "*** No files match: ${(fileMasks + excludeMasks.collect { "--exclude $it" }).join(', ')}"
+    println()
+    println "*** Done"
+    return
+}
 
 Process proc = null
 

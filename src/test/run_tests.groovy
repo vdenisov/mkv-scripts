@@ -1053,6 +1053,95 @@ runTest('38_non_ascii_titles_round_trip') { workDir ->
           "no replacement characters in the renamed files; got ${names}")
 }
 
+// ─── File masks ──────────────────────────────────────────────────────────────
+// Note these run the script through ProcessBuilder, which passes argv straight
+// through without a shell, so no pattern below is ever expanded before the
+// script sees it. That is exactly the cmd.exe situation, which a Linux-only CI
+// would otherwise never cover.
+
+/** Names of the MKVs produced in workDir/mkv, sorted. */
+def outputNames = { File workDir ->
+    (new File(workDir, 'mkv').listFiles() ?: []).collect { it.name }.sort()
+}
+
+/** Stage three episodes plus a sample and a non-media file. */
+def stageBatch = { File workDir ->
+    ['Show.S01E01.mkv', 'Show.S01E02.mkv', 'Show.S01E03.mkv',
+     'Show.S01E01.sample.mkv'].each { stageInput(workDir, it) }
+    new File(workDir, 'notes.txt').text = 'not a video'
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true]]))
+}
+
+// ─── 39. a mask that is an exact file name selects only that file ────────────
+runTest('39_file_mask_literal_name') { workDir ->
+    stageBatch(workDir)
+    def (code, out) = runMkvGroovy(workDir, ['Show.S01E02.mkv'])
+    checkEquals(code, 0, 'exit code')
+    checkEquals(outputNames(workDir), ['Show.S01E02.mkv'], 'only the named file muxed')
+}
+
+// ─── 40. a glob arrives unexpanded and is expanded by the script ─────────────
+runTest('40_file_mask_glob_unexpanded') { workDir ->
+    stageBatch(workDir)
+    def (code, out) = runMkvGroovy(workDir, ['Show.S01E0[12].mkv'])
+    checkEquals(code, 0, 'exit code')
+    checkEquals(outputNames(workDir), ['Show.S01E01.mkv', 'Show.S01E02.mkv'],
+                'bracket glob expanded by the script, and did not match the sample')
+}
+
+// ─── 41. several masks union together ────────────────────────────────────────
+runTest('41_file_mask_multiple') { workDir ->
+    stageBatch(workDir)
+    def (code, out) = runMkvGroovy(workDir, ['Show.S01E01.mkv', 'Show.S01E03.mkv'])
+    checkEquals(code, 0, 'exit code')
+    checkEquals(outputNames(workDir), ['Show.S01E01.mkv', 'Show.S01E03.mkv'], 'both masks applied')
+}
+
+// ─── 42. --exclude removes files from an otherwise full batch ────────────────
+runTest('42_file_mask_exclude') { workDir ->
+    stageBatch(workDir)
+    def (code, out) = runMkvGroovy(workDir, ['--exclude', '*.sample.mkv'])
+    checkEquals(code, 0, 'exit code')
+    checkEquals(outputNames(workDir),
+                ['Show.S01E01.mkv', 'Show.S01E02.mkv', 'Show.S01E03.mkv'],
+                'sample excluded, everything else still muxed')
+}
+
+// ─── 43. a mask matching nothing says so instead of silently doing nothing ───
+runTest('43_file_mask_no_match') { workDir ->
+    stageBatch(workDir)
+    def (code, out) = runMkvGroovy(workDir, ['Nope.*.mkv'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('No files match'), 'reports that nothing matched')
+    check(out.contains('Nope.*.mkv'), 'names the offending pattern')
+    checkEquals(outputNames(workDir), [], 'nothing muxed')
+    check(!new File(workDir, 'mkv').exists(), 'destination directory not created')
+}
+
+// ─── 44. a file whose own name contains glob metacharacters ──────────────────
+// The reason masks are matched literally when they name an existing file: read
+// as a glob, 'Odd[1].mkv' would also match 'Odd1.mkv', so there would otherwise
+// be no way to select such a file at all.
+runTest('44_file_mask_literal_beats_glob') { workDir ->
+    stageInput(workDir, 'Odd[1].mkv')
+    stageInput(workDir, 'Odd1.mkv')
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true]]))
+
+    def (code, out) = runMkvGroovy(workDir, ['Odd[1].mkv'])
+    checkEquals(code, 0, 'exit code')
+    checkEquals(outputNames(workDir), ['Odd[1].mkv'], 'matched itself, not Odd1.mkv')
+}
+
+// ─── 45. masks apply to --identify too, not just muxing ──────────────────────
+runTest('45_file_mask_applies_to_identify') { workDir ->
+    stageBatch(workDir)
+    def (code, out) = runMkvGroovy(workDir, ['--identify', 'Show.S01E02.mkv'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Show.S01E02.mkv'),  'identifies the masked file')
+    check(!out.contains('Show.S01E01.mkv'), 'does not identify the others')
+    check(!new File(workDir, 'mkv').exists(), 'identify still muxes nothing')
+}
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 println()
