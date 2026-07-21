@@ -30,21 +30,23 @@ if (args.length == 0 || (args.length == 1 && args[0] in ['-h', '--help'])) {
     return
 }
 
-// Locate mkvpropedit: try PATH first, then the Windows default install location
-def findMkvTool = { String name ->
-    try {
-        def probe = [name, '--version'].execute()
-        probe.waitFor()
-        if (probe.exitValue() == 0) return name
-    } catch (ignored) {}
-    if (System.getProperty('os.name').toLowerCase().contains('win')) {
-        def path = "C:\\Program Files\\MKVToolNix\\${name}.exe"
-        if (new File(path).exists()) return path
-    }
-    throw new RuntimeException("'$name' not found on PATH or in default install location. Install MKVToolNix.")
-}
+// Shared console-output helpers, resolved relative to this script's own
+// location — see output.groovy for why they are loaded explicitly by path.
+// Loaded after the usage/early-return above, so a bare -h stays instant.
+// Deliberately no --color option: every argument is passed through to
+// mkvpropedit verbatim, so intercepting one would break the passthrough
+// contract. Colour is controlled by auto-detection and NO_COLOR only.
+def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+def ui = evaluate(new File(scriptDir, 'output.groovy'))('auto')
+def findMkvTool = evaluate(new File(scriptDir, 'tools.groovy'))
 
-def mkvpropeditExe = findMkvTool('mkvpropedit')
+def mkvpropeditExe
+try {
+    mkvpropeditExe = findMkvTool('mkvpropedit')
+} catch (RuntimeException e) {
+    ui.error(e.message)
+    System.exit(2)
+}
 
 def fileName = null
 def commandLine = ([mkvpropeditExe, "${-> fileName}.mkv"] + (args as List)) as ArrayList
@@ -60,7 +62,7 @@ def failed = 0
 
 files.forEach { file ->
     {
-        println "*** Processing ${file.name}"
+        ui.header("*** Processing ${file.name}")
         println()
 
         fileName = FilenameUtils.getBaseName(file.name)
@@ -71,7 +73,7 @@ files.forEach { file ->
 
         if (proc.exitValue() != 0) {
             println()
-            println "*** Error: ${proc.exitValue()}"
+            ui.error("mkvpropedit exited with code ${proc.exitValue()}")
             failed++
         }
 
@@ -79,11 +81,12 @@ files.forEach { file ->
     }
 }
 
+// The summary is the batch's result, so it stays on stdout in both colours;
+// the per-file errors already went to stderr as they happened. Exit non-zero
+// if anything failed, so this is usable from a script.
 println()
-println "*** Done"
-
-// Exit non-zero if anything failed, so this is usable from a script
 if (failed > 0) {
-    println "*** ${failed} of ${files.size()} file(s) failed"
+    println ui.red("*** ${files.size() - failed} processed, ${failed} failed")
     System.exit(1)
 }
+ui.success("*** ${files.size()} processed, 0 failed")

@@ -30,6 +30,16 @@ import java.nio.charset.UnsupportedCharsetException
                     description = "Report what would be converted without writing anything")
 @Field boolean dryRun = false
 
+@CommandLine.Option(names = ["--color"], paramLabel = "WHEN",
+                    description = "Colorize output: auto (default, only on a terminal and not under NO_COLOR), " +
+                                  "always, or never")
+@Field String colorMode = "auto"
+
+// Shared console-output helpers, resolved relative to this script's own
+// location — see output.groovy for why they are loaded explicitly by path.
+def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)
+
 // Text subtitle formats worth converting. '.sub' is deliberately absent: the
 // extension is ambiguous between MicroDVD text and the binary VobSub half of a
 // .idx/.sub pair, and rewriting a VobSub .sub would destroy it.
@@ -40,7 +50,7 @@ def charset
 try {
     charset = Charset.forName(sourceEncoding)
 } catch (UnsupportedCharsetException | IllegalCharsetNameException e) {
-    System.err.println "Unknown source encoding '${sourceEncoding}': ${e.class.simpleName}"
+    ui.error("Unknown source encoding '${sourceEncoding}': ${e.class.simpleName}")
     System.err.println "Use a charset name your JVM knows, e.g. windows-1251, windows-1250, Shift_JIS, Big5."
     System.exit(2)
 }
@@ -61,7 +71,7 @@ def startsWith = { byte[] bytes, int[] prefix ->
     bytes.length >= prefix.length && (0..<prefix.length).every { (bytes[it] & 0xFF) == prefix[it] }
 }
 
-println "*** Converting ${extensions.sort().join(', ')} files from ${charset.name()} to UTF-8"
+ui.header("*** Converting ${extensions.sort().join(', ')} files from ${charset.name()} to UTF-8")
 if (dryRun) println "*** Dry run: nothing will be written"
 println()
 
@@ -70,7 +80,7 @@ def files = (new File(".").listFiles({
 } as FileFilter) as List<File>)?.sort { it.name } ?: []
 
 if (!files) {
-    println "*** No ${extensions.sort().join('/')} files in the current directory"
+    println ui.yellow("*** No ${extensions.sort().join('/')} files in the current directory")
     return
 }
 
@@ -111,8 +121,8 @@ files.each { file ->
     try {
         text = strictDecode(bytes, charset)
     } catch (CharacterCodingException e) {
-        println "*** ${file.name}: not valid ${charset.name()} (${e.class.simpleName}), leaving it alone"
-        println "      Pass the right --encoding; converting anyway would produce mojibake."
+        ui.error("${file.name}: not valid ${charset.name()} (${e.class.simpleName}), leaving it alone")
+        System.err.println "      Pass the right --encoding; converting anyway would produce mojibake."
         failed++
         return
     }
@@ -138,7 +148,10 @@ files.each { file ->
 }
 
 println()
-println "*** ${converted} converted, ${skipped} skipped, ${failed} failed"
+// The summary is the batch's result, so it stays on stdout in both colours;
+// the per-file details already went to stderr as they happened.
+def summary = "*** ${converted} converted, ${skipped} skipped, ${failed} failed"
+if (failed > 0) println ui.red(summary) else ui.success(summary)
 
 // Non-zero on failure so this is usable from a shell script, matching
 // propedit.groovy rather than mux.groovy's always-exit-0 batch behaviour

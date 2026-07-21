@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Groovy toolkit for automating MKV video file workflows — primarily for TV show episodes. Scripts are run individually from the command line; there is no build step or package manager beyond `@Grab` annotations. A self-contained test harness lives in `src/test/`.
 
+**Documentation layers:** `README.md` is the front gate — setup, the script tour, and a minimal config quick-start only. User-facing depth (output/colour conventions, the check-report reading guide, the full `config.yaml` field reference) lives in `docs/reference.md`; the README links each trimmed topic to its reference section. This file holds implementation internals. When adding documentation, put it in the right layer instead of growing the README.
+
 ## Running scripts
 
 All scripts operate on the current working directory — in practice the directory containing the media files. `mux.groovy` reads `config.yaml` from the CWD (per-show config next to the media files) or from an explicit `--config <path>`; there is **no** fallback to a config next to the script. The repo ships `src/config.example.yaml` as a template — it is never auto-loaded, because silently applying a demo config's track selections to an unrelated directory produced confidently wrong output (a wrong `config title` on the `--check` verdict was the giveaway). The inspection modes (`--identify`, `--check`, `--check-verbose`) run **without** a config; only a muxing run requires one, and a muxing run with no config is a clean exit-2 error pointing at the template, not a stack trace. Only the test suite is run from the repo root:
@@ -34,12 +36,12 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 
 `to_utf8.groovy` converts `.srt`/`.ass`/`.ssa`/`.vtt` **in place**. It skips input that is already UTF-8 — by BOM or by a clean strict UTF-8 decode, which also covers pure ASCII — so re-running over a directory is a no-op rather than a corruption. Decoding uses `CodingErrorAction.REPORT`, because Java's default decoder silently replaces invalid bytes and a wrong `--encoding` would otherwise produce mojibake that looks like success. UTF-16 input is refused outright: every byte of it maps to something in a single-byte charset, so strict decoding alone would not catch it. `.sub` is excluded on purpose — ambiguous between MicroDVD text and binary VobSub. Content is decoded and re-encoded whole, not line by line, so CRLF survives.
 
-**Exit-code asymmetry:** `propedit.groovy` and `to_utf8.groovy` exit non-zero if any file failed (`to_utf8.groovy` also exits 2 on an unusable `--encoding` name, before touching anything), so both are usable from a shell script. `mux.groovy` deliberately keeps its continue-on-error, always-exit-0 behaviour (a test depends on it, and a partially-successful batch mux is a normal outcome there) — the one exception is `--strict`, which exits 2 when the consistency check finds a discrepancy affecting a selected track.
+**Exit-code discipline:** every batch script — `propedit.groovy`, `to_utf8.groovy`, `filename_to_title.groovy`, `fix_srt.groovy`, `rename.groovy` — exits non-zero if any file failed, so all are usable from a shell script. Environment/setup errors exit 2 before touching anything: an unusable `--encoding` name in `to_utf8.groovy`, a missing mkvpropedit in `propedit.groovy`/`filename_to_title.groovy`. `fetch_episodes.groovy` exits 2 on API-key problems and 3 on network/API failures. `mux.groovy` deliberately keeps its continue-on-error, always-exit-0 behaviour (a test depends on it, and a partially-successful batch mux is a normal outcome there) — the one exception is `--strict`, which exits 2 when the consistency check finds a discrepancy affecting a selected track.
 
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 81 tests
+groovy src/test/run_tests.groovy              # Run all 90 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```
@@ -81,6 +83,24 @@ TheMovieDB API
                       find_unused_fonts.groovy  (font cleanup)
 ```
 
+## Shared helper files: `src/output.groovy` and `src/tools.groovy`
+
+The only two files in `src/` that are not standalone scripts. Both are loaded at runtime by explicit path, resolved from the calling script's own location (never the CWD, which is the media directory):
+
+```groovy
+def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)   // 'auto' literal in scripts without --color
+def findMkvTool = evaluate(new File(scriptDir, 'tools.groovy'))
+```
+
+**Never reference these as classes** (`Output.foo()` style). Groovy's implicit sibling-class resolution is CWD- and invocation-dependent — that failure mode is why earlier attempts at shared helpers in this project were abandoned. Explicit `evaluate()` by absolute path (the same script-location resolution `fetch_episodes.groovy` uses for `apikey.txt`) has no such dependence and works identically under the `bin/` wrappers, foreign CWDs, and both CI legs. Both files have **no `@Grab` and no imports**, so loading them never touches the network or the caller's classloader setup (`@GrabConfig(systemClassLoader = true)` is unaffected), and each file's last expression is its exported value: a factory closure in `output.groovy` (call it with the color mode, get a map of helpers), the `findMkvTool` closure itself in `tools.groovy`. The test harness loads both via its `repoRoot`.
+
+`output.groovy` owns the palette — red 31 errors/failure summaries, green 32 success (`*** Done`, clean summaries, `[PASS]`), yellow 33 warnings + the `--check` differing-cell highlight, cyan 36 section/file/table-column headers, gray 90 de-emphasis of the `--check` file-evidence lists (never an accent) — plus the gating (`always`, or `auto` on a terminal without `NO_COLOR`; anything else is `never`) and the shared message forms: `error(msg)`/`warn(msg)` print `*** Error: `/`*** Warning: ` to **stderr**; `header`/`success` print to stdout; `plural(n, noun)` lives here too. The terminal probe calls `Console.isTerminal()` where it exists (JDK 22+ returns a Console even when piped), falling back to the plain null-check on JDK 11/21.
+
+**The colour invariant: escapes wrap whole lines or whole pre-padded table cells, never a fragment inside a phrase.** The suite asserts with substring `contains(...)` on captured output, so a mid-phrase escape breaks tests (and reads as flicker anyway); padding before colour is what keeps the `--check` table aligned. The one sanctioned two-segment line is `printMinority`'s marker row: the `<-` stays default-foreground while the file name after it is gray — still whole segments, and the pinned substrings (`<-`, the file name) each stay contiguous. Tests run the scripts through a pipe, so `auto` colour is off in every test — only the `--color always` cases (82–84) ever see escapes.
+
+Placement follows the closure-scoping rule below: in `mux.groovy` the `ui` load is the first script-body statement, because closures capture it at definition time. In `propedit.groovy` the load sits after the usage/early-return block so a bare `-h` stays instant.
+
 ## `mux.groovy` internals
 
 `mux.groovy` is the core script. It reads `config.yaml` from the CWD (or `--config <path>`), discovers all files in the current directory matching `allowedExtensions`, and for each file constructs and executes an `mkvmerge` command.
@@ -103,7 +123,7 @@ Lazy GString closures (`${-> fileName}`) are used throughout `buildCommandLine` 
 
 The report works in **two layers**, which is the key design decision and came out of a real mixed-layout season (some episodes had the subtitle track first). First it groups files by **layout** (`layoutKey` — the type at each ID), printed largest group first as `*** Layout N (K files): <type sequence>` (the header appears only when there is more than one layout). A per-ID comparison alone put the same shifted file at three different IDs and was unreadable. Then, within each group, `groupTracks` compares **values** per ID — codec, language, name, default, forced (`SIG_KEYS`); the video track's name is nulled *at construction* in `trackSignature` so it can never leak into a group key. Grouping ranks by population and never anchors on the first file. Because the value table runs per layout, every ID has one type there, so the `(absent)`/`tg.missing` branches are dead for that set (a missing track is a whole different layout) — kept only as defensive guards.
 
-Output specifics that were hard-won in review: the differing cell is highlighted (`hl`/`cell`, ANSI yellow) under `--color` (`auto` = on only when `System.console() != null`, so piped/CI/test output is plain and never breaks an assertion); the NAME column is the last column and dynamically sized to the longest name (`nameWidth`, clamped 12–60), so no trailing padding and no clipping; there is no FILES count column — the `<-` lists (one file name per line via `formatFileList`) carry that. In the largest group the strict-majority row is the unnamed reference and only minorities are named; an outlier group has no reference (all files named — a uniform one lists them above its table, a split one names each value's files). `formatFileList` must clamp `take` to `names.size()` because `--check-verbose` passes `limit = Integer.MAX_VALUE` and `take(MAX)` allocates a 2-billion-element array (OOM). **`--check-verbose` implies `--check`** (`checkOnly = checkOnly || checkVerbose`): it is a report modifier, and without this a bare `--check-verbose` printed the report and then muxed the whole batch.
+Output specifics that were hard-won in review: the differing cell is highlighted (`hl`/`cell`, ANSI yellow) under `--color`, with the gating shared via `output.groovy` (`auto` = on only on a real terminal, so piped/CI/test output is plain and never breaks an assertion); the NAME column is the last column and dynamically sized to the longest name (`nameWidth`, clamped 12–60), so no trailing padding and no clipping; there is no FILES count column — the `<-` lists (one file name per line via `formatFileList`) carry that. In the largest group the strict-majority row is the unnamed reference and only minorities are named; an outlier group has no reference (all files named — a uniform one lists them above its table, a split one names each value's files). `formatFileList` must clamp `take` to `names.size()` because `--check-verbose` passes `limit = Integer.MAX_VALUE` and `take(MAX)` allocates a 2-billion-element array (OOM). **`--check-verbose` implies `--check`** (`checkOnly = checkOnly || checkVerbose`): it is a report modifier, and without this a bare `--check-verbose` printed the report and then muxed the whole batch.
 
 `findDuplicates` flags only genuinely ambiguous same-language tracks (type+language+codec+name all equal). Classification: a layout outlier is blocking when it changes the type at a selected ID or drops one; a per-ID value discrepancy is blocking via `isBlocking` (selected ID *and* `copiesAllOfType` false). `--strict` exits 2 on any blocking finding; default warns and continues. `--check` alone returns before muxing; `--check --identify` falls through to the identify loop, which prints per-file tables then returns before muxing because `identifyOnly` is set.
 

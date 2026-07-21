@@ -32,20 +32,29 @@ import java.time.LocalDate
                     description = "Override the API base URL (for testing)")
 @Field String baseUrl = "https://api.themoviedb.org"
 
+@CommandLine.Option(names = ["--color"], paramLabel = "WHEN",
+                    description = "Colorize output: auto (default, only on a terminal and not under NO_COLOR), " +
+                                  "always, or never")
+@Field String colorMode = "auto"
+
+// Shared console-output helpers, resolved relative to this script's own
+// location — see output.groovy for why they are loaded explicitly by path.
+def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)
+
 // The current directory takes precedence, falling back to a copy next to this
 // script, so the key does not have to be copied into every media directory. This
 // is a personal secret the user places (unlike mux.groovy's config, which no
 // longer falls back to the script directory).
 if (apiKey == null || "" == apiKey) {
-    def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
     def keyFile = [new File("apikey.txt"), new File(scriptDir, "apikey.txt")].find { it.exists() }
     if (keyFile == null) {
-        System.err.println "No API key: pass --api-key, or create apikey.txt in the current directory or next to fetch_episodes.groovy"
+        ui.error("No API key: pass --api-key, or create apikey.txt in the current directory or next to fetch_episodes.groovy")
         System.exit(2)
     }
     apiKey = keyFile.readLines().find { it.trim() }?.trim()
     if (!apiKey) {
-        System.err.println "API key file is empty: ${keyFile.absolutePath}"
+        ui.error("API key file is empty: ${keyFile.absolutePath}")
         System.exit(2)
     }
 }
@@ -73,7 +82,7 @@ def get = { String path ->
     try {
         response = client.send(request, HttpResponse.BodyHandlers.ofString())
     } catch (IOException e) {
-        System.err.println "Request to ${baseUrl}${path} failed: ${e.message}"
+        ui.error("Request to ${baseUrl}${path} failed: ${e.message}")
         System.exit(3)
     }
 
@@ -86,30 +95,30 @@ def get = { String path ->
 
     if (response.statusCode() != 200) {
         def detail = (body instanceof Map && body.status_message) ? body.status_message : response.body()
-        System.err.println "TheMovieDB returned HTTP ${response.statusCode()} for ${path}: ${detail}"
+        ui.error("TheMovieDB returned HTTP ${response.statusCode()} for ${path}: ${detail}")
         System.exit(3)
     }
 
     if (body == null) {
-        System.err.println "TheMovieDB returned a non-JSON response for ${path}"
+        ui.error("TheMovieDB returned a non-JSON response for ${path}")
         System.exit(3)
     }
 
     body
 }
 
-println "Fetching episodes from TheMovieDB..."
+ui.header("*** Fetching episodes from TheMovieDB...")
 
 def show = get("/3/tv/${showId}")
 
 // first_air_date is absent or empty for unaired shows, so do not assume it parses
 def airYear = show.first_air_date ? LocalDate.parse(show.first_air_date).year : "year unknown"
-println "The show is ${show.name} (${airYear})"
+println "*** The show is ${show.name} (${airYear})"
 
 def seasonData = get("/3/tv/${showId}/season/${season}")
 
 if (!seasonData.episodes) {
-    System.err.println "No episodes returned for season ${season} - check the season number"
+    ui.error("No episodes returned for season ${season} - check the season number")
     System.exit(3)
 }
 
@@ -120,12 +129,12 @@ def episodeNames = seasonData.episodes.collect {
         .replaceAll(/[\\\/:*?"<>|]/, '')
         .replaceAll(/[. ]+$/, '')
     if (filteredName != it.name) {
-        println "Name ${it.name} contains invalid characters, replaced with ${filteredName}"
+        println "*** Name ${it.name} contains invalid characters, replaced with ${filteredName}"
     }
     filteredName
 }
 
-println "Fetched ${episodeNames.size()} episode names"
+println "*** Fetched ${episodeNames.size()} episode names"
 
 // Always UTF-8, never the platform default: episodes.txt is handed to
 // rename.groovy, which must read it back with the same charset. Relying on the
@@ -135,4 +144,4 @@ new File("episodes.txt").withWriter('UTF-8') { out ->
     episodeNames.each { out.println it }
 }
 
-println "Done."
+ui.success("*** Done")
