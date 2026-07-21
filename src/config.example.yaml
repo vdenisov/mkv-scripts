@@ -1,10 +1,27 @@
 # MKV Muxing Configuration
 
+# Any title below may use substitution variables — see "Substitution variables"
+# in README.md for the full list.
+#
+#   File scope (valid anywhere):  fileName, extension, showName, seasonNum,
+#                                 episodeNum, episodeName, seasonName, showYear
+#   Track scope (valid in a track title): language, languageName,
+#                                 languageNative, codec
+#
+# Episode data comes from episodes.yaml (or episodes.txt) in this directory,
+# written by mkv-fetch-episodes; showName/episodeName also fall back to a
+# canonical "Show - SxxEyy - Title" file name. A misspelled variable is an
+# error before anything is muxed, never a literal in the output.
+
 # General settings
 general:
   destinationDir: "mkv"
   allowedExtensions: ["mkv", "avi", "mp4"]
   mkvmergeExe: "C:\\Program Files\\MKVToolNix\\mkvmerge.exe"
+  # Segment (container) title. Defaults to the file name when omitted.
+  # This is a different field from the video track name below — most players
+  # show this one, but they are stored separately and are worth setting apart.
+  # title: "${showName} - S${seasonNum}E${episodeNum} - ${episodeName}"
 
 # Main source track settings
 mainSource:
@@ -12,7 +29,8 @@ mainSource:
     language: "en"
     # title will be set to filename by default
     # Uncomment to override video track name
-    # title: "Custom Video Title"
+    # title: "Original Japanese"
+    # title: "BDRip ${codec}"
 
   audioTracks:
     - id: 2
@@ -21,7 +39,8 @@ mainSource:
       default: true
     - id: 1
       language: "ru"
-      title: "Russian"
+      # "Русский DTS", derived from the language above and the actual codec
+      title: "${languageNative} ${codec}"
       default: false
     # Uncomment to add a third audio track
     # - id: 13
@@ -55,7 +74,10 @@ mainSource:
 trackOrder: "0:0,0:2,0:1,0:6"
 
 # Additional sources
-# Uncomment to add a second source file
+# Uncomment to add a second source file. The file path takes the same file-scope
+# variables as the titles above — ${fileName} is the usual one, but a companion
+# living in a per-studio folder works just as well:
+#   file: "Rus sound/[Studio]/${fileName}.mka"
 # additionalSources:
 #   - file: "${fileName}[Dub Studio].mka"
 #     tracks:

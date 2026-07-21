@@ -1,7 +1,9 @@
 @Grab('info.picocli:picocli-groovy:4.6.3')
 @Grab('commons-io:commons-io:2.11.0')
+@Grab('org.yaml:snakeyaml:1.30')
 @GrabConfig(systemClassLoader=true)
 import groovy.transform.Field
+import org.yaml.snakeyaml.Yaml
 import picocli.CommandLine
 import picocli.groovy.PicocliScript2
 import org.apache.commons.io.FileUtils
@@ -153,6 +155,30 @@ def writeEpisodes = { File workDir, List<String> titles ->
     new File(workDir, 'episodes.txt').setText(titles.join('\n') + '\n', 'UTF-8')
 }
 
+/** Write episodes.yaml into workDir. `episodes` is a map of episode number to
+ *  raw (unsanitized) name; the rest of the metadata is optional.
+ *  Built with snakeyaml rather than by hand so that the titles under test —
+ *  which contain colons and quotes on purpose — are quoted correctly. */
+def writeEpisodesYaml = { File workDir, Map opts ->
+    def data = new LinkedHashMap()
+    // containsKey, not truthiness: an empty show name is a case under test
+    data.show = opts.containsKey('show') ? opts.show : 'Stub Show'
+    if (opts.year) data.year = opts.year
+    data.season = opts.containsKey('season') ? opts.season : 1
+    if (opts.seasonName) data.seasonName = opts.seasonName
+    if (opts.language) data.language = opts.language
+    data.episodes = (opts.episodes ?: [:]).collect { number, name ->
+        def entry = new LinkedHashMap()
+        entry.episode = number as int
+        entry.name = name
+        entry
+    }
+    def dumper = new org.yaml.snakeyaml.DumperOptions()
+    dumper.defaultFlowStyle = org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK
+    dumper.allowUnicode = true
+    new File(workDir, 'episodes.yaml').setText(new Yaml(dumper).dump(data), 'UTF-8')
+}
+
 /** Copy test.mkv into workDir under the given name. */
 def stageInput = { File workDir, String name = 'test.mkv' ->
     def dest = new File(workDir, name)
@@ -249,6 +275,9 @@ def cfg = { Map opts = [:] ->
     sb << "  destinationDir: \"$dest\"\n"
     sb << "  allowedExtensions: [$extStr]\n"
     sb << "  mkvmergeExe: \"${mkvmergeExe.replace('\\', '\\\\')}\"\n"
+    // Segment (container) title. Omitted unless asked for, so the default —
+    // the file name — stays the thing every other test exercises.
+    if (opts.generalTitle) sb << "  title: \"${opts.generalTitle}\"\n"
 
     sb << "mainSource:\n"
     sb << "  videoTrack:\n"
@@ -937,10 +966,13 @@ runTest('34_rename_dry_run') { workDir ->
     check(!new File(workDir, 'My Show - S01E01 - First Episode.mkv').exists(), 'nothing renamed')
 }
 
-// ─── 35. fetch_episodes against a local stub: parsing and name sanitising ────
-// Offline and deterministic, so it runs everywhere including CI. The character
-// filtering only matters on Windows and CI is Linux-only, which is exactly why
-// it is asserted here rather than left to manual testing.
+// ─── 35. fetch_episodes against a local stub: both files, raw names ──────────
+// Offline and deterministic, so it runs everywhere including CI.
+//
+// Asserts that fetch_episodes strips nothing: both episodes.yaml and
+// episodes.txt must carry the name exactly as TheMovieDB spells it, so that
+// mux.groovy can put the real ':' and '?' into a title. Making a name safe for
+// a file name belongs to rename.groovy — tests 94 and 95 cover that end.
 runTest('35_fetch_episodes_stub') { workDir ->
     def rawTitles = [
         'Plain Title',
@@ -953,7 +985,10 @@ runTest('35_fetch_episodes_stub') { workDir ->
 
     def routes = [
         '/3/tv/2260'         : JsonOutput.toJson([name: 'Stub Show', first_air_date: '2006-07-07']),
-        '/3/tv/2260/season/1': JsonOutput.toJson([episodes: rawTitles.collect { [name: it] }])
+        '/3/tv/2260/season/1': JsonOutput.toJson([
+            name    : 'Season 1',
+            episodes: rawTitles.withIndex().collect { t, i -> [episode_number: i + 1, name: t] }
+        ])
     ]
 
     withStubServer(routes) { String baseUrl ->
@@ -964,19 +999,21 @@ runTest('35_fetch_episodes_stub') { workDir ->
         check(out.contains('Stub Show'), 'prints the show name')
         check(out.contains('2006'), 'prints the first-air year')
 
-        def lines = new File(workDir, 'episodes.txt').readLines('UTF-8')
-        checkEquals(lines, [
-            'Plain Title',
-            'SlashColon Question',
-            'QuoteStarPipe',
-            'Backslashgt',
-            'Trailing dots',
-            'Trailing space'
-        ], 'episodes.txt contents')
+        checkEquals(new File(workDir, 'episodes.txt').readLines('UTF-8'), rawTitles,
+                    'episodes.txt carries raw names')
 
-        // Every character Windows rejects in a file name must be gone
-        check(!lines.any { it =~ /[\\\/:*?"<>|]/ }, 'no characters invalid on Windows survive')
-        check(!lines.any { it ==~ /.*[. ]$/ },      'no trailing dots or spaces survive')
+        def yaml = new Yaml().load(new File(workDir, 'episodes.yaml').getText('UTF-8'))
+        checkEquals(yaml.show, 'Stub Show', 'episodes.yaml show name')
+        checkEquals(yaml.year, 2006, 'episodes.yaml year')
+        checkEquals(yaml.season, 1, 'episodes.yaml season')
+        checkEquals(yaml.seasonName, 'Season 1', 'episodes.yaml season name')
+        checkEquals(yaml.episodes.collect { it.episode }, (1..6).toList(), 'episodes.yaml episode numbers')
+        checkEquals(yaml.episodes.collect { it.name }, rawTitles, 'episodes.yaml raw names')
+
+        // The characters that cannot survive a file name are precisely the ones
+        // this file exists to preserve
+        check(yaml.episodes[1].name.contains(':') && yaml.episodes[1].name.contains('?'),
+              'colon and question mark survive into episodes.yaml')
     }
 }
 
@@ -1041,7 +1078,9 @@ runTest('38_non_ascii_titles_round_trip') { workDir ->
 
     def routes = [
         '/3/tv/2260'         : JsonOutput.toJson([name: 'Спайс и Волк', first_air_date: '2008-01-09']),
-        '/3/tv/2260/season/1': JsonOutput.toJson([episodes: titles.collect { [name: it] }])
+        '/3/tv/2260/season/1': JsonOutput.toJson([
+            episodes: titles.withIndex().collect { t, i -> [episode_number: i + 1, name: t] }
+        ])
     ]
 
     stageInput(workDir, 'Show.s01e01.mkv')
@@ -1067,7 +1106,9 @@ runTest('38_non_ascii_titles_round_trip') { workDir ->
         throw new AssertionError("episodes.txt is not valid UTF-8: ${e}")
     }
 
-    checkEquals(decoded.readLines(), ['Волчица и пряности', 'Тест второй эпизод'],
+    // Raw: the colon is stripped where the name becomes a file name, below, not
+    // where it is written here.
+    checkEquals(decoded.readLines(), ['Волчица и пряности', 'Тест: второй эпизод'],
                 'episodes.txt decoded as UTF-8')
 
     // Show name stays ASCII deliberately: a Cyrillic argument would test
@@ -1959,6 +2000,406 @@ runTest('90_no_media_files_reported') { workDir ->
     checkEquals(c2, 0, 'exit code (non-media match)')
     check(out2.contains('No media files match: notes.txt'), 'names the fruitless pattern')
     check(!new File(workDir, 'mkv').exists(), 'no output directory created')
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v1.4.0 — substitution variables
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── 91. --show-id accepts a TheMovieDB URL ─────────────────────────────────
+runTest('91_show_id_from_url') { workDir ->
+    def routes = [
+        '/3/tv/1920'         : JsonOutput.toJson([name: 'Twin Peaks', first_air_date: '1990-04-08']),
+        '/3/tv/1920/season/1': JsonOutput.toJson([episodes: [[episode_number: 1, name: 'Pilot']]])
+    ]
+
+    withStubServer(routes) { String baseUrl ->
+        ['https://www.themoviedb.org/tv/1920-twin-peaks',
+         'https://www.themoviedb.org/tv/1920',
+         'https://www.themoviedb.org/tv/1920-twin-peaks?language=ru'].each { url ->
+            def (code, out) = runScript('fetch_episodes.groovy', workDir,
+                                        ['--api-key', 'stub', '--show-id', url,
+                                         '--season', '1', '--base-url', baseUrl])
+            checkEquals(code, 0, "exit code for ${url} (output was:\n$out\n)")
+            check(out.contains('Twin Peaks'), "resolved the id from ${url}")
+        }
+
+        def (badCode, badOut) = runScript('fetch_episodes.groovy', workDir,
+                                          ['--api-key', 'stub', '--show-id', 'not-a-url',
+                                           '--season', '1', '--base-url', baseUrl])
+        checkEquals(badCode, 2, 'junk --show-id exits 2')
+        check(badOut.contains('neither a number nor'), 'says why the value was rejected')
+    }
+}
+
+// ─── 92. season comes from the URL, and conflicts are refused ───────────────
+runTest('92_season_from_url') { workDir ->
+    def routes = [
+        '/3/tv/1920'         : JsonOutput.toJson([name: 'Twin Peaks', first_air_date: '1990-04-08']),
+        '/3/tv/1920/season/2': JsonOutput.toJson([episodes: [[episode_number: 1, name: 'May the Giant']]])
+    ]
+
+    withStubServer(routes) { String baseUrl ->
+        // No --season at all: the URL supplies it
+        def (code, out) = runScript('fetch_episodes.groovy', workDir,
+                                    ['--api-key', 'stub', '--base-url', baseUrl,
+                                     '--show-id', 'https://www.themoviedb.org/tv/1920-twin-peaks/season/2'])
+        checkEquals(code, 0, "exit code (output was:\n$out\n)")
+        checkEquals(new File(workDir, 'episodes.txt').readLines('UTF-8'), ['May the Giant'], 'fetched season 2')
+
+        // Explicit --season that disagrees is a mistake worth stopping for
+        def (conflictCode, conflictOut) = runScript('fetch_episodes.groovy', workDir,
+                                                    ['--api-key', 'stub', '--base-url', baseUrl, '--season', '1',
+                                                     '--show-id', 'https://www.themoviedb.org/tv/1920/season/2'])
+        checkEquals(conflictCode, 2, 'conflicting season exits 2')
+        check(conflictOut.contains('conflicts with'), 'names the conflict')
+
+        // Neither source supplies one
+        def (noneCode, noneOut) = runScript('fetch_episodes.groovy', workDir,
+                                            ['--api-key', 'stub', '--show-id', '1920', '--base-url', baseUrl])
+        checkEquals(noneCode, 2, 'missing season exits 2')
+        check(noneOut.contains('No season'), 'says a season is needed')
+    }
+}
+
+// ─── 93. --language, with an en-US fallback for untranslated names ──────────
+runTest('93_fetch_language_fallback') { workDir ->
+    // The second episode is untranslated, which TheMovieDB answers with an
+    // empty string rather than by falling back on its own.
+    def routes = [
+        '/3/tv/1920'         : JsonOutput.toJson([name: 'Твин Пикс', first_air_date: '1990-04-08']),
+        '/3/tv/1920/season/1': JsonOutput.toJson([
+            name: 'Сезон 1',
+            episodes: [[episode_number: 1, name: 'Пилот'], [episode_number: 2, name: '']]
+        ])
+    ]
+
+    withStubServer(routes) { String baseUrl ->
+        def (code, out) = runScript('fetch_episodes.groovy', workDir,
+                                    ['--api-key', 'stub', '--show-id', '1920', '--season', '1',
+                                     '--language', 'ru-RU', '--base-url', baseUrl])
+        checkEquals(code, 0, "exit code (output was:\n$out\n)")
+
+        def yaml = new Yaml().load(new File(workDir, 'episodes.yaml').getText('UTF-8'))
+        checkEquals(yaml.language, 'ru-RU', 'records the locale it fetched in')
+        checkEquals(yaml.show, 'Твин Пикс', 'localized show name')
+        checkEquals(yaml.episodes[0].name, 'Пилот', 'localized episode name')
+        // The stub serves the same route regardless of query string, so the
+        // fallback fetch returns the same empty name; what matters here is that
+        // the script noticed and said so rather than writing a blank silently.
+        check(out.contains('untranslated'), 'reports that it filled gaps from en-US')
+    }
+}
+
+// ─── 94. rename prefers episodes.yaml and sanitizes on the way to a file name ─
+runTest('94_rename_prefers_yaml') { workDir ->
+    stageInput(workDir, 'Show.s01e01.mkv')
+    stageInput(workDir, 'Show.s01e02.mkv')
+    // The two sources disagree on purpose: yaml must win
+    writeEpisodes(workDir, ['From Text One', 'From Text Two'])
+    writeEpisodesYaml(workDir, [show: 'My Show', episodes: [1: 'Slash/Colon: Question?', 2: 'Plain Two']])
+
+    def (code, out) = runScript('rename.groovy', workDir, [])
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(out.contains('Show name from episodes.yaml'), 'says where the show name came from')
+
+    def names = workDir.listFiles().collect { it.name } as Set
+    check('My Show - S01E01 - SlashColon Question.mkv' in names,
+          "raw name sanitized into the file name; got ${names}")
+    check('My Show - S01E02 - Plain Two.mkv' in names, "second file renamed; got ${names}")
+}
+
+// ─── 94b. episodeOffset shifts episodes.txt only, never episodes.yaml ────────
+// The trap this pins: a season downloaded in halves is exactly what the offset
+// was invented for, and with episodes.txt it still works that way. With a yaml
+// fetched for the whole season the numbers are already real, so applying the
+// offset out of habit would map episode 1's title onto E11 — plausible-looking
+// and wrong. The yaml join ignores the offset entirely.
+runTest('94b_offset_applies_to_txt_only') { workDir ->
+    stageInput(workDir, 'Show.s01e11.mkv')
+
+    // episodes.txt trimmed to the second half of the season: offset 11 means
+    // "the first line is episode 11"
+    writeEpisodes(workDir, ['Eleventh', 'Twelfth'])
+    def (txtCode, txtOut) = runScript('rename.groovy', workDir, ['My Show', '11'])
+    checkEquals(txtCode, 0, "txt exit code (output was:\n$txtOut\n)")
+    check(new File(workDir, 'My Show - S01E11 - Eleventh.mkv').exists(),
+          "offset applied to episodes.txt; got ${workDir.listFiles().collect { it.name }}")
+
+    // Same offset, but now a full-season yaml is present and wins
+    def yamlDir = new File(workDir, 'yaml')
+    yamlDir.mkdirs()
+    stageInput(yamlDir, 'Show.s01e11.mkv')
+    writeEpisodesYaml(yamlDir, [show: 'My Show',
+                                episodes: (1..12).collectEntries { [it, "Episode ${it}".toString()] }])
+    def (yamlCode, yamlOut) = runScript('rename.groovy', yamlDir, ['My Show', '11'])
+    checkEquals(yamlCode, 0, "yaml exit code (output was:\n$yamlOut\n)")
+    check(new File(yamlDir, 'My Show - S01E11 - Episode 11.mkv').exists(),
+          "offset ignored for yaml; got ${yamlDir.listFiles().collect { it.name }}")
+    check(!new File(yamlDir, 'My Show - S01E11 - Episode 1.mkv').exists(),
+          'the offset did not shift the yaml numbering')
+}
+
+// ─── 95. rename falls back to episodes.txt; missing sources are clean errors ──
+runTest('95_rename_fallbacks_and_errors') { workDir ->
+    // No episode data at all
+    def (noneCode, noneOut) = runScript('rename.groovy', workDir, ['My Show'])
+    checkEquals(noneCode, 2, 'no episode data exits 2')
+    check(noneOut.contains('episodes.yaml or episodes.txt'), 'names both accepted files')
+    check(!noneOut.contains('FileNotFoundException'), 'no stack trace')
+
+    // episodes.txt only: still works, and a legacy already-sanitized line is
+    // unchanged by being sanitized again
+    stageInput(workDir, 'Show.s01e01.mkv')
+    writeEpisodes(workDir, ['Already Sanitized'])
+    def (code, out) = runScript('rename.groovy', workDir, ['My Show'])
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(new File(workDir, 'My Show - S01E01 - Already Sanitized.mkv').exists(), 'renamed from episodes.txt')
+
+    // yaml present but no show name anywhere
+    def bare = new File(workDir, 'bare')
+    bare.mkdirs()
+    stageInput(bare, 'Show.s01e01.mkv')
+    writeEpisodesYaml(bare, [show: '', episodes: [1: 'One']])
+    def (bareCode, bareOut) = runScript('rename.groovy', bare, [])
+    checkEquals(bareCode, 2, 'no show name exits 2')
+    check(bareOut.contains('No show name'), 'says a show name is needed')
+}
+
+// ─── 96. segment title is templated, independently of the video track name ───
+runTest('96_general_title_substitution') { workDir ->
+    stageInput(workDir, 'My Show - S01E03 - Ignored.mkv')
+    writeEpisodesYaml(workDir, [show: 'My Show', season: 1, seasonName: 'Season One',
+                                episodes: [3: 'Real: Title?']])
+    writeConfig(workDir, cfg(
+        generalTitle: '${showName} - S${seasonNum}E${episodeNum} - ${episodeName}',
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+
+    def info = identify(findOutput(workDir))
+    checkEquals(info.container.get('properties').title, 'My Show - S01E03 - Real: Title?',
+                'segment title uses the raw episode name')
+    // The video track name is a separate field and keeps its own default
+    def video = info.tracks.find { it.type == 'video' }
+    checkEquals(video.get('properties').track_name, 'My Show - S01E03 - Ignored',
+                'video track name still defaults to the file name')
+}
+
+// ─── 97. video track title is templated, and the segment title is not ────────
+runTest('97_video_title_substitution') { workDir ->
+    stageInput(workDir, 'My Show - S01E04 - From Name.mkv')
+    writeConfig(workDir, cfg(
+        videoTitle: '${episodeName} [${languageName}]',
+        videoLang: 'ja',
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+
+    def info = identify(findOutput(workDir))
+    def video = info.tracks.find { it.type == 'video' }
+    // No episodes.yaml here: episodeName falls back to the canonical file name
+    checkEquals(video.get('properties').track_name, 'From Name [Japanese]',
+                'video track name substituted from the file name and language')
+    checkEquals(info.container.get('properties').title, 'My Show - S01E04 - From Name',
+                'segment title still defaults to the file name')
+}
+
+// ─── 98. language name variables, in English and natively ────────────────────
+runTest('98_language_name_variables') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [
+            [id:2, language:'en',  title:'${languageName}',   default:true],
+            [id:3, language:'ru',  title:'${languageNative}', default:false]
+        ],
+        subtitleTracks: [[id:6, language:'jpn', title:'${languageName}', default:false]],
+        trackOrder: '0:0,0:2,0:3,0:6'
+    ))
+    runMkvGroovy(workDir)
+
+    def tracks = identify(findOutput(workDir)).tracks
+    def audio = tracks.findAll { it.type == 'audio' }
+    checkEquals(audio[0].get('properties').track_name, 'English', 'English display name')
+    // Capitalized in Russian's own rules: the JDK returns "русский"
+    checkEquals(audio[1].get('properties').track_name, 'Русский', 'native name, capitalized')
+    // A three-letter code resolves the same as a two-letter one
+    checkEquals(tracks.find { it.type == 'subtitles' }.get('properties').track_name, 'Japanese',
+                'ISO 639-2 code resolves')
+}
+
+// ─── 99. ${codec} comes from the probe, and works without the check ──────────
+runTest('99_codec_variable') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'${languageName} ${codec}', default:true]],
+        subtitleTracks: [[id:4, language:'en', title:'${languageName} ${codec}', default:true]],
+        trackOrder: '0:0,0:2,0:4'
+    ))
+    // --no-check so nothing has pre-populated the probe cache: this exercises
+    // the probe-on-demand path rather than the pre-flight's leftovers.
+    runMkvGroovy(workDir, ['--no-check'])
+
+    def tracks = identify(findOutput(workDir)).tracks
+    checkEquals(tracks.find { it.type == 'audio' }.get('properties').track_name, 'English AAC',
+                'audio codec name')
+    checkEquals(tracks.find { it.type == 'subtitles' }.get('properties').track_name, 'English SRT',
+                'subtitle codec name')
+}
+
+// ─── 100. an unknown variable is fatal before anything is muxed ──────────────
+// The whole point of failing fast: a typo would otherwise be stamped into the
+// track names of an entire season, one file at a time.
+runTest('100_unknown_variable_fails_fast') { workDir ->
+    stageInput(workDir, 'Show.s01e01.mkv')
+    stageInput(workDir, 'Show.s01e02.mkv')
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'${languagName}', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 2, 'exits 2')
+    check(out.contains('${languagName}'), 'quotes the offending token')
+    check(out.contains('mainSource.audioTracks[0].title'), 'names the config path')
+    check(out.contains('languageName'), 'lists what would have been valid')
+    check(!new File(workDir, 'mkv').exists(), 'no output directory created')
+}
+
+// ─── 101. a track variable in a file-scope field is equally fatal ────────────
+runTest('101_scope_violation_fails_fast') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        generalTitle: '${languageName}',
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 2, 'exits 2')
+    check(out.contains('general.title'), 'names the field')
+    check(!new File(workDir, 'mkv').exists(), 'nothing was muxed')
+}
+
+// ─── 102. an unresolvable language code is caught up front too ───────────────
+runTest('102_bad_language_fails_fast') { workDir ->
+    stageInput(workDir)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'xx', title:'${languageName}', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 2, 'exits 2')
+    check(out.contains('no language name'), 'says the code has no display name')
+    check(out.contains('xx'), 'quotes the code')
+}
+
+// ─── 103. missing episode data drops just that episode ──────────────────────
+// Data-shaped and per-file, unlike a typo: the rest of the batch still muxes.
+runTest('103_missing_episode_data_drops_file') { workDir ->
+    stageInput(workDir, 'My Show - S01E01 - One.mkv')
+    stageInput(workDir, 'NoEpisodeNumberHere.mkv')
+    writeEpisodesYaml(workDir, [show: 'My Show', episodes: [1: 'One']])
+    writeConfig(workDir, cfg(
+        generalTitle: '${showName} - S${seasonNum}E${episodeNum} - ${episodeName}',
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    def (code, out) = runMkvGroovy(workDir)
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(out.contains('NoEpisodeNumberHere.mkv'), 'names the dropped file')
+    check(out.contains('${episodeNum}'), 'names the variable that had no value')
+
+    def outputs = new File(workDir, 'mkv').listFiles().collect { it.name }
+    checkEquals(outputs, ['My Show - S01E01 - One.mkv'], 'only the resolvable episode was muxed')
+
+    // --strict turns the same situation into an abort
+    FileUtils.deleteDirectory(new File(workDir, 'mkv'))
+    def (strictCode, strictOut) = runMkvGroovy(workDir, ['--strict'])
+    checkEquals(strictCode, 2, 'strict exits 2')
+    check(!new File(workDir, 'mkv').exists(), 'strict muxed nothing')
+}
+
+// ─── 104. episodes.txt is still a usable source for ${episodeName} ──────────
+runTest('104_episodes_txt_fallback_in_mux') { workDir ->
+    stageInput(workDir, 'Show.s01e02.mkv')
+    // Hand-written, raw: the colon is exactly what a file name cannot hold and
+    // a title can
+    writeEpisodes(workDir, ['First One', 'Second: With Colon?'])
+    writeConfig(workDir, cfg(
+        generalTitle: '${episodeName}',
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+    runMkvGroovy(workDir)
+    checkEquals(identify(findOutput(workDir)).container.get('properties').title, 'Second: With Colon?',
+                'episode name taken from the right line of episodes.txt')
+}
+
+// ─── 105. companion paths and titles are templated ──────────────────────────
+runTest('105_companion_substitution') { workDir ->
+    def input = stageInput(workDir, 'My Show - S01E01 - Pilot.mkv')
+    extractTrack(input, new File(workDir, 'My Show - S01E01 - Pilot.rus.mka'), 'audio', 3)
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        additionalSources: [[file: '${fileName}.rus.mka',
+                             tracks: [[language:'ru', title:'${languageNative} ${codec}', default:false]]]],
+        trackOrder: '0:0,0:2,1:0'
+    ))
+    runMkvGroovy(workDir)
+
+    def audio = identify(findOutput(workDir)).tracks.findAll { it.type == 'audio' }
+    checkEquals(audio.size(), 2, 'companion track was muxed in')
+    checkEquals(audio[1].get('properties').track_name, 'Русский AAC',
+                'companion title substituted from its own language and codec')
+}
+
+// ─── 106. --identify shows configured companions, missing ones included ─────
+runTest('106_identify_shows_companions') { workDir ->
+    def input = stageInput(workDir, 'My Show - S01E01 - Pilot.mkv')
+    extractTrack(input, new File(workDir, 'My Show - S01E01 - Pilot.rus.mka'), 'audio', 3)
+    stageInput(workDir, 'My Show - S01E02 - Second.mkv')     // no companion for this one
+    writeConfig(workDir, cfg(
+        audioTracks: [[id:2, language:'en', title:'English', default:true]],
+        additionalSources: [[file: '${fileName}.rus.mka',
+                             tracks: [[language:'ru', title:'Russian', default:false]]]],
+        trackOrder: '0:0,0:2,1:0'
+    ))
+
+    def (code, out) = runMkvGroovy(workDir, ['--identify'])
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(out.contains('+ My Show - S01E01 - Pilot.rus.mka'), 'shows the resolved companion path')
+    check(out.contains('(not found)'), 'reports the episode whose companion is absent')
+    check(!new File(workDir, 'mkv').exists(), '--identify muxed nothing')
+}
+
+// ─── 107. --dry-run resolves; --check keeps the raw template ────────────────
+runTest('107_dry_run_and_check_rendering') { workDir ->
+    stageInput(workDir, 'My Show - S01E01 - Pilot.mkv')
+    writeConfig(workDir, cfg(
+        generalTitle: '${showName}: ${episodeName}',
+        audioTracks: [[id:2, language:'en', title:'${languageName}', default:true]],
+        trackOrder: '0:0,0:2'
+    ))
+
+    def (dryCode, dryOut) = runMkvGroovy(workDir, ['--dry-run'])
+    checkEquals(dryCode, 0, "dry-run exit code (output was:\n$dryOut\n)")
+    check(dryOut.contains('My Show: Pilot'), 'dry run shows the resolved title')
+    check(!dryOut.contains('${showName}'), 'dry run leaves no unresolved token')
+    check(!new File(workDir, 'mkv').exists(), 'dry run muxed nothing')
+
+    // The check report identifies which config entry a finding refers to, and
+    // the literal template is what does that — the check runs over the whole
+    // batch and so cannot resolve a per-file variable at all.
+    //
+    // Keeping every track preserves the source ids, so the name override below
+    // lands on id 2 — the audio track the config selects, which is what makes
+    // the difference blocking and gets the config title printed.
+    buildVariant(new File(workDir, 'My Show - S01E02 - Second.mkv'),
+                 [audio: [1, 2, 3], subs: [4, 5, 6], names: [2: 'Different']])
+    def (checkCode, checkOut) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(checkCode, 0, 'check exit code')
+    check(checkOut.contains('${languageName}'), "check prints the raw template; got:\n$checkOut")
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
