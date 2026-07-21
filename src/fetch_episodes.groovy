@@ -32,9 +32,10 @@ import java.time.LocalDate
                     description = "Override the API base URL (for testing)")
 @Field String baseUrl = "https://api.themoviedb.org"
 
-// Resolve the API key file the same way mux.groovy resolves config.yaml: the
-// current directory takes precedence, falling back to the copy next to this
-// script, so the key does not have to be copied into every media directory
+// The current directory takes precedence, falling back to a copy next to this
+// script, so the key does not have to be copied into every media directory. This
+// is a personal secret the user places (unlike mux.groovy's config, which no
+// longer falls back to the script directory).
 if (apiKey == null || "" == apiKey) {
     def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
     def keyFile = [new File("apikey.txt"), new File(scriptDir, "apikey.txt")].find { it.exists() }
