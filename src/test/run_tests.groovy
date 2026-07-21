@@ -35,24 +35,18 @@ def mkvgroovy = new File(repoRoot, 'src/mux.groovy')
 def binDir    = new File(repoRoot, 'bin')
 def workRoot  = new File(scriptDir, 'work')
 
+// Shared colour helpers — auto mode: coloured on a dev terminal, plain when
+// piped (CI logs) or under NO_COLOR. See src/output.groovy.
+def ui = evaluate(new File(repoRoot, 'src/output.groovy'))('auto')
+
 def isWindows = System.getProperty('os.name').toLowerCase().contains('win')
 def groovyBin = isWindows ? 'bin/groovy.bat' : 'bin/groovy'
 def groovyExe = new File(System.getProperty('groovy.home', ''), groovyBin).with {
     exists() ? absolutePath : 'groovy'
 }
 
-def findMkvTool = { String name ->
-    try {
-        def proc = [name, '--version'].execute()
-        proc.waitFor()
-        if (proc.exitValue() == 0) return name
-    } catch (ignored) {}
-    if (isWindows) {
-        def path = "C:\\Program Files\\MKVToolNix\\${name}.exe"
-        if (new File(path).exists()) return path
-    }
-    throw new RuntimeException("'$name' not found on PATH or in default install location. Install MKVToolNix.")
-}
+// Shared with the scripts under test; see src/tools.groovy.
+def findMkvTool = evaluate(new File(repoRoot, 'src/tools.groovy'))
 
 def mkvmergeExe = mkvmergeExeOverride ?: findMkvTool('mkvmerge')
 
@@ -71,12 +65,14 @@ def failures = []
 def passes   = []
 def lastMkvOutput = null
 
-/** Run a command list; return [exitCode, stdout+stderr combined]. */
-def exec = { cmd, File cwd = null ->
+/** Run a command list; return [exitCode, stdout+stderr combined].
+ *  env: extra environment variables for the child (e.g. NO_COLOR). */
+def exec = { cmd, File cwd = null, Map env = [:] ->
     def pb = new ProcessBuilder(cmd.collect { it.toString() })
     pb.redirectErrorStream(true)
     // Ensure JAVA_HOME points at the JVM actually running this process
     pb.environment().put('JAVA_HOME', System.getProperty('java.home'))
+    env.each { k, v -> pb.environment().put(k.toString(), v.toString()) }
     if (cwd) pb.directory(cwd)
     def proc = pb.start()
     def out = proc.inputStream.text
@@ -166,10 +162,10 @@ def stageInput = { File workDir, String name = 'test.mkv' ->
 
 /** Run any script from the repo's src/ in workDir; return [exitCode, output].
  *  The output is also kept for diagnostics if the test fails. */
-def runScript = { String scriptName, File workDir, List extraArgs = [] ->
+def runScript = { String scriptName, File workDir, List extraArgs = [], Map env = [:] ->
     def script = new File(repoRoot, "src/${scriptName}")
     assert script.exists() : "script not found at $script"
-    def result = exec([groovyExe, script.absolutePath] + extraArgs, workDir)
+    def result = exec([groovyExe, script.absolutePath] + extraArgs, workDir, env)
     lastMkvOutput = result[1]
     result
 }
@@ -224,10 +220,10 @@ def runTest = { String name, Closure body ->
     try {
         body(workDir)
         passes << name
-        println "[PASS] $name"
+        println ui.green("[PASS] $name")
     } catch (Throwable t) {
         failures << [name: name, msg: t.message ?: t.toString()]
-        println "[FAIL] $name: ${t.message ?: t}"
+        println ui.red("[FAIL] $name: ${t.message ?: t}")
         if (lastMkvOutput) {
             println "  --- mkv.groovy output ---"
             lastMkvOutput.eachLine { println "  $it" }
@@ -1785,14 +1781,196 @@ runTest('81_check_without_config') { workDir ->
     check(!new File(workDir, 'mkv').exists(), 'still muxes nothing')
 }
 
+// ─── 82. --color always emits ANSI escapes ───────────────────────────────────
+// The harness captures output through a pipe, so auto-mode colour is off in
+// every other test; this is the one place the escapes themselves are asserted.
+// ESC is built at runtime so no raw control byte lives in this source file.
+def esc = "${(char) 27}"
+runTest('82_color_always_emits_ansi') { workDir ->
+    fullCopy(new File(workDir, 'a.mkv'))
+    fullCopy(new File(workDir, 'b.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    writeConfig(workDir, checkCfg())
+
+    def (code, out) = runMkvGroovy(workDir, ['--check', '--color', 'always'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains("${esc}[33m"), 'differing cells and warnings are yellow')
+    check(out.contains("${esc}[36m"), 'section and table headers are cyan')
+    check(out.contains("${esc}[32m"), 'the final Done is green')
+    check(out.contains("${esc}[90m"), 'file-evidence lists are gray')
+    check(out.contains("${esc}[0m"), 'escapes are reset')
+    // The whole-line/whole-cell invariant: colour must not break the pinned
+    // phrases the other check tests assert on.
+    check(out.contains('*** Pre-flight check'), 'header text survives colouring intact')
+}
+
+// ─── 83. --color never suppresses ANSI; explicit always beats NO_COLOR ───────
+runTest('83_color_never_and_no_color_precedence') { workDir ->
+    fullCopy(new File(workDir, 'a.mkv'))
+    fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
+    writeConfig(workDir, checkCfg())
+
+    def (c1, out1) = runMkvGroovy(workDir, ['--check', '--color', 'never'])
+    checkEquals(c1, 0, 'exit code (never)')
+    check(!out1.contains("${esc}["), 'no escapes under --color never')
+
+    // NO_COLOR (no-color.org) disables auto-detection, but an explicit
+    // --color always is a direct request and wins. NO_COLOR-under-auto cannot
+    // be exercised through a subprocess at all: the pipe already turns auto
+    // off, so that path is covered by every other (escape-free) test instead.
+    def (c2, out2) = runScript('mux.groovy', workDir, ['--check', '--color', 'always'], [NO_COLOR: '1'])
+    checkEquals(c2, 0, 'exit code (always + NO_COLOR)')
+    check(out2.contains("${esc}["), 'explicit --color always beats NO_COLOR')
+}
+
+// ─── 84. to_utf8 colours its summary by outcome, whole-line only ─────────────
+runTest('84_to_utf8_color_summary') { workDir ->
+    writeBytes(workDir, 'ok.srt', 'Привет\n'.getBytes('windows-1251'))
+
+    def (c1, out1) = runToUtf8(workDir, ['--color', 'always'])
+    checkEquals(c1, 0, 'exit code (clean)')
+    check(out1.contains("${esc}[32m*** 1 converted, 0 skipped, 0 failed${esc}[0m"),
+          "clean summary is green with the escapes at the line edges; got:\n$out1")
+
+    // Same Shift_JIS-invalid bytes as test 55: not valid UTF-8 either, so the
+    // file reaches the strict decode and fails there.
+    writeBytes(workDir, 'bad.srt', [0x81, 0x20, 0x41] as byte[])
+    def (c2, out2) = runToUtf8(workDir, ['--encoding', 'Shift_JIS', '--color', 'always'])
+    checkEquals(c2, 1, 'exit code (failure)')
+    check(out2.contains("${esc}[31m"), 'failure output carries red')
+    check(out2.contains('1 failed'), 'pinned summary substring survives colouring')
+}
+
+// ─── 85. filename_to_title writes the bare name, no stray quotes ─────────────
+// Regression guard for the embedded-\" bug: list-exec needs no manual quoting,
+// so the title must be exactly the base file name on every platform.
+runTest('85_filename_to_title_sets_title') { workDir ->
+    if (!mkvpropeditExe) {
+        println "  (skipped: mkvpropedit not available)"
+        return
+    }
+
+    def input = stageInput(workDir, 'My Episode.mkv')
+    def (code, out) = runScript('filename_to_title.groovy', workDir)
+    checkEquals(code, 0, 'exit code')
+
+    def parsed = identify(input)
+    checkEquals(parsed.container.get('properties').title, 'My Episode', 'segment title, unquoted')
+    def video = parsed.tracks.find { it.type == 'video' }
+    checkEquals(video.get('properties').track_name, 'My Episode', 'video track name, unquoted')
+    check(out.contains('1 processed, 0 failed'), 'summary printed')
+}
+
+// ─── 86. filename_to_title continues past a bad file and exits 1 ─────────────
+runTest('86_filename_to_title_exit_on_failure') { workDir ->
+    if (!mkvpropeditExe) {
+        println "  (skipped: mkvpropedit not available)"
+        return
+    }
+
+    new File(workDir, 'bad.mkv').text = 'not an mkv at all'
+    def good = stageInput(workDir, 'good.mkv')
+
+    def (code, out) = runScript('filename_to_title.groovy', workDir)
+    checkEquals(code, 1, 'exits 1 when any file failed')
+    check(out.contains('*** Error:'), 'reports the failure')
+    check(out.contains('1 processed, 1 failed'), 'summary counts both outcomes')
+    checkEquals(identify(good).container.get('properties').title, 'good',
+                'the good file was still processed')
+}
+
+// ─── 87. fix_srt reformats the legacy format into .srt.fixed ─────────────────
+// First-ever coverage of fix_srt: legacy "hh:mm:ss.cc,hh:mm:ss.cc" timing plus
+// [br] line breaks become numbered SRT cues with "-->" timing.
+runTest('87_fix_srt_fixes_valid_file') { workDir ->
+    new File(workDir, 'ep.srt').text =
+        '00:01:41.42,00:01:42.30\n' +
+        'Line one[br]Line two\n' +
+        '\n' +
+        '00:01:43.00,00:01:44.00\n' +
+        'Another line\n' +
+        '\n'
+
+    def (code, out) = runScript('fix_srt.groovy', workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('Fixing ep.srt'), 'names the file')
+    check(out.contains('1 fixed, 0 failed'), 'summary printed')
+
+    def fixedFile = new File(workDir, 'ep.srt.fixed')
+    check(fixedFile.exists(), '.fixed output written next to the source')
+    def lines = fixedFile.readLines()
+    checkEquals(lines[0], '1', 'first cue number')
+    checkEquals(lines[1], '00:01:41,420 --> 00:01:42,300', 'SRT arrow timing')
+    checkEquals(lines[2], 'Line one', '[br] split, first half')
+    checkEquals(lines[3], 'Line two', '[br] split, second half')
+    checkEquals(lines[5], '2', 'second cue numbered')
+}
+
+// ─── 88. fix_srt survives a malformed file, fixes the rest, exits 1 ──────────
+// One bad file used to kill the whole run with a stack trace (a bare assert).
+runTest('88_fix_srt_exit_on_failure') { workDir ->
+    new File(workDir, 'bad.srt').text =
+        '00:01:41.42,00:01:42.30\n' +
+        'Text\n' +
+        'not-blank where a blank line belongs\n'
+    new File(workDir, 'good.srt').text =
+        '00:01:43.00,00:01:44.00\n' +
+        'Fine\n' +
+        '\n'
+
+    def (code, out) = runScript('fix_srt.groovy', workDir)
+    checkEquals(code, 1, 'exits 1 when any file failed')
+    check(out.contains('*** Error:') && out.contains('bad.srt'), 'error names the bad file')
+    check(!out.contains('Exception'), 'no stack trace')
+    check(out.contains('1 fixed, 1 failed'), 'summary counts both outcomes')
+    check(new File(workDir, 'good.srt.fixed').exists(), 'the good file was still fixed')
+    check(!new File(workDir, 'bad.srt.fixed').exists(), 'no partial output for the bad file')
+}
+
+// ─── 89. propedit exits 1 when a file fails, and says so ─────────────────────
+// The exit-1 contract was documented from the start but never test-pinned.
+runTest('89_propedit_failure_exit') { workDir ->
+    if (!mkvpropeditExe) {
+        println "  (skipped: mkvpropedit not available)"
+        return
+    }
+
+    new File(workDir, 'bad.mkv').text = 'not an mkv at all'
+    def (code, out) = runScript('propedit.groovy', workDir,
+                                ['--edit', 'info', '--set', 'title=X'])
+    checkEquals(code, 1, 'exits 1 when any file failed')
+    check(out.contains('*** Error:'), 'reports the failure')
+    check(out.contains('0 processed, 1 failed'), 'summary counts the failure')
+}
+
+// ─── 90. an empty batch says why instead of a bare "Done" ────────────────────
+// A green "Done" in an empty (or all-non-media) directory looks identical to a
+// successful run that had no work — e.g. after a typo'd cd.
+runTest('90_no_media_files_reported') { workDir ->
+    // Empty directory, no masks
+    def (c1, out1) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(c1, 0, 'exit code (empty dir)')
+    check(out1.contains('No media files'), 'says the directory has nothing to work on')
+    check(out1.contains('mkv'), 'names the extensions it looked for')
+
+    // A mask that matches a file, just not a media file
+    new File(workDir, 'notes.txt').text = 'not media'
+    def (c2, out2) = runMkvGroovy(workDir, ['--identify', 'notes.txt'])
+    checkEquals(c2, 0, 'exit code (non-media match)')
+    check(out2.contains('No media files match: notes.txt'), 'names the fruitless pattern')
+    check(!new File(workDir, 'mkv').exists(), 'no output directory created')
+}
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 println()
 println '═' * 50
-println "${passes.size()} passed, ${failures.size()} failed"
+def summary = "${passes.size()} passed, ${failures.size()} failed"
 if (failures) {
+    println ui.red(summary)
     println()
     println 'FAILURES:'
-    failures.each { println "  [FAIL] ${it.name}: ${it.msg}" }
+    failures.each { println ui.red("  [FAIL] ${it.name}: ${it.msg}") }
     System.exit(1)
 }
+println ui.green(summary)

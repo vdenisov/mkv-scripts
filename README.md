@@ -110,7 +110,7 @@ suite is run from the repo root:
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
 | `propedit.groovy` | Batch-runs `mkvpropedit` over every MKV in the current directory, passing your arguments through — fix any property (track names, forced/default flags, …) without a full remux. |
 | `to_utf8.groovy` | Converts `.srt`/`.ass`/`.ssa`/`.vtt` subtitles to UTF-8 in place, from `--encoding` (default Windows-1251). Skips files that are already UTF-8; `--backup` keeps the originals. |
-| `fix_srt.groovy` | Converts subtitles in a non-standard timing format into valid SRT (writes `<name>.srt.fixed`). |
+| `fix_srt.groovy` | Converts subtitles in a non-standard timing format into valid SRT (writes `<name>.srt.fixed`). A malformed file is reported and skipped rather than stopping the batch. |
 | `find_unused_fonts.groovy` | Lists font files in `fonts/` that are not referenced by any `.ass` subtitle in the current directory. |
 
 ### fetch_episodes.groovy
@@ -220,14 +220,10 @@ with `--check`, which muxes nothing and needs no `config.yaml` — so you can in
 a season's structure before writing one. `--check` and `--identify` can be combined;
 they answer different questions and share one `mkvmerge` scan.
 
-It works in two layers. First it groups files by **track layout** — the type at
-each ID. Files that share a layout are the same release and get one table; files
-whose layout differs (a different track order, or a track missing) are a different
-release and get their own, largest group first. This keeps a shifted-track-order
-release from being smeared across the per-ID table, where the same file would
-otherwise appear at every shifted ID. Then, within each group, it compares the
-**values** at each ID — codec, language, name, default/forced flags — stacking a
-row per distinct value and naming the files that carry it:
+Files are first grouped by **track layout** — a shifted track order or a missing
+track forms its own group — and the **values** at each ID (codec, language, name,
+default/forced flags) are then compared within each group, one row per distinct
+value:
 
 ```
 *** Layout 1 (20 files): video, audio, subs
@@ -252,34 +248,18 @@ row per distinct value and naming the files that carry it:
       track 2 (subtitles, config title "Signs") - default differs across 2 groups
 ```
 
-How to read it:
+- One row per distinct value, not per file — a 200-episode batch is as compact
+  as a 3-episode one, and the differing cell is highlighted on a terminal.
+- The `<-` lists name only the deviating files; the majority is the unnamed
+  reference.
+- With a `config.yaml` present, each difference is classified as **blocking**
+  (it lands on a track the config selects) or informational.
+- By default the check warns and continues; `--strict` aborts with exit 2 on any
+  blocking discrepancy, and `--check-verbose` prints untruncated file lists.
 
-- **Structural groups, largest first.** Files with a different track order or a
-  missing track form their own group, listed once — not once per shifted ID.
-- **One row per distinct value, not per file** — a 200-episode batch is as compact
-  as a 3-episode one. Every track is listed, so the table doubles as the map you
-  check `config.yaml`'s IDs against. The `DEF`/`FOR` columns make a flag-only
-  difference legible, and on a terminal the differing cell is highlighted.
-- **The `<-` names only the files that deviate**, one per line; the majority is the
-  unnamed reference.
-- **Blocking vs informational.** A difference only corrupts output when it lands on
-  a track the config selects by ID *and* not every track of that type is being
-  copied. Everything else — unselected tracks, chapters, a type copied wholesale —
-  is reported as informational.
-
-What is compared: per layout, the type at each ID; then per ID, codec, language,
-name and default/forced flags, plus chapter presence and genuinely ambiguous
-same-language duplicates (two tracks that match on type, language, codec *and*
-name, where ID selection cannot tell them apart). What is ignored: the video
-track's title, which carries the episode name and differs by design, along with
-duration, file size and muxing metadata.
-
-By default the check **warns and continues** — muxing the wrong tracks is
-recoverable, the source files survive. Pass `--strict` to abort (exit 2) when any
-discrepancy affects a selected track. File lists are truncated to a few names;
-`--check-verbose` prints them in full (and, like `--check`, muxes nothing).
-Highlighting follows `--color` (`auto` by default: on at a terminal, off when
-redirected).
+The full reading guide — what is compared and ignored, the exact
+blocking-vs-informational rules, colours — is in the
+[reference](docs/reference.md#reading-the-consistency-check-report).
 
 `--identify` prints the track table you need in order to write the config — id,
 type, codec, language, default/forced flags and track name for every track of
@@ -349,203 +329,46 @@ that configurable would defeat the script's purpose.
 
 Pass `--backup` to keep the original as `<name>.orig`, or `--dry-run` to preview.
 
-Three things make it safe to point at a directory more than once:
-
-- **Files that are already UTF-8 are skipped** — detected by BOM or by decoding
-  cleanly as UTF-8. Pure ASCII lands here too, correctly: it is already valid
-  UTF-8. Double-converting is precisely how a previously fixed file gets ruined.
-- **Decoding is strict.** Java's default decoder *replaces* bytes that are invalid
-  in the source charset, so a wrong `--encoding` would otherwise succeed quietly
-  and produce mojibake. Instead the file is reported and left alone, and the run
-  exits non-zero.
-- **UTF-16 input is detected and skipped** — otherwise it would decode to
-  mojibake that looks valid.
-
-`.sub` is deliberately excluded: the extension is ambiguous between MicroDVD text
-and the binary half of a VobSub `.idx`/`.sub` pair, and rewriting the binary one
-would destroy it.
-
-Line endings are preserved — the file is decoded and re-encoded whole rather than
-line by line, so CRLF subtitles stay CRLF.
+It is safe to point at a directory more than once: already-UTF-8 files are
+skipped, decoding is strict (a wrong `--encoding` is refused rather than quietly
+producing mojibake), UTF-16 input is left alone, `.sub` files are deliberately
+excluded, and line endings survive conversion. The full rationale is in the
+[reference](docs/reference.md#to_utf8groovy-safety).
 
 ## Configuration
 
-`mux.groovy` is driven by a YAML configuration file (`config.yaml` in the media
-directory, or `--config <path>`); copy the shipped template
-`src/config.example.yaml` as a starting point.
+`mux.groovy` is driven by a YAML configuration file — `config.yaml` in the media
+directory, or `--config <path>`. Quick start:
 
-### General settings
+1. Copy `src/config.example.yaml` next to your media files as `config.yaml`.
+2. Run `mkv-mux --identify` to see each file's track IDs.
+3. Keep the tracks you want, delete the rest:
 
 ```yaml
 general:
-  destinationDir: "mkv"                                # Output directory
-  allowedExtensions: ["mkv", "avi", "mp4"]            # File extensions to process
-  # mkvmergeExe is optional: omit it to auto-detect mkvmerge from PATH,
-  # or set it to a full path to override.
-  mkvmergeExe: "C:\\Program Files\\MKVToolNix\\mkvmerge.exe"
-```
+  destinationDir: "mkv"           # output goes here
+  allowedExtensions: ["mkv"]
 
-### Main source settings
-
-Defines tracks from the primary source file. Track IDs come from `mkvmerge -i`;
-track 0 is always the video track.
-
-```yaml
 mainSource:
   videoTrack:
-    language: "en"                                    # Video track language
-    # title will be set to filename by default
-    # title: "Custom Video Title"                     # Optional: override video track name
-
+    language: "ja"                # title defaults to the file name
   audioTracks:
-    - id: 2                                           # Track ID from mkvmerge -i
-      language: "en"                                  # Track language
-      title: "English"                                # Track title
-      default: true                                   # Is default track (omit = false)
-    - id: 1
-      language: "ru"
-      title: "Russian"
-      default: false
-
-  subtitleTracks:
-    - id: 6
-      language: "en"
-      title: "English"
-      charset: "UTF-8"                                # Optional: character set override
-      default: true
-
-  # additionalOptions:
-  #   - "--compression"
-  #   - "0:none"
-```
-
-- Omitting `audioTracks` entirely (or setting it to `[]`) copies no audio tracks.
-- Omitting `subtitleTracks` entirely (or setting it to `[]`) copies no subtitle tracks.
-- `charset` is optional; omit it to let mkvmerge use the subtitle file's detected encoding.
-- `default` defaults to `false`/`no` when omitted.
-
-### Track order
-
-Controls the order of tracks in the output. Each entry is `sourceIndex:trackId`,
-where source 0 is the main source.
-
-**`trackOrder` is optional.** When omitted, it is derived from the tracks you
-configured above, in the order you listed them:
-
-1. the video track (`0:0`),
-2. `mainSource.audioTracks`, in listed order,
-3. `mainSource.subtitleTracks`, in listed order,
-4. one entry per `additionalSources` file (`1:0`, `2:0`, …).
-
-For most configs that is exactly what you want, and the derived value is printed
-when the script runs. Set `trackOrder` explicitly only to override it:
-
-```yaml
-trackOrder: "0:0,0:2,0:1,0:6"
-```
-
-An explicit `trackOrder` is checked against the configured tracks, and any
-mismatch is reported as a warning — muxing still proceeds. This matters because
-mkvmerge itself **silently ignores** entries that match no muxed track, so a
-stale ID left behind after editing the track lists would otherwise have no
-visible effect at all.
-
-### Additional sources
-
-Include tracks from extra files (audio dubs, external subtitles). Each
-additional source must contain exactly one track. Track ID is always 0.
-
-`${fileName}` in the `file` field is replaced at runtime with the base name (no
-extension) of the current main source file, enabling per-episode companion
-files.
-
-```yaml
-additionalSources:
-  - file: "${fileName}[Dub Studio].mka"               # ${fileName} = base name of main source
-    tracks:
-      - language: "en"
-        title: "English"
-        charset: "UTF-8"                              # Optional: charset for subtitle tracks
-        default: false
-    # additionalOptions:
-    #   - "--compression"
-    #   - "0:none"
-```
-
-### Example configurations
-
-#### Basic configuration with English audio and subtitles
-
-`trackOrder` is omitted here, so it is derived as `0:0,0:1,0:2`:
-
-```yaml
-mainSource:
-  videoTrack:
-    language: "en"
-  audioTracks:
-    - id: 1
-      language: "en"
-      title: "English"
-      default: true
-  subtitleTracks:
-    - id: 2
-      language: "en"
-      title: "English"
-      default: true
-```
-
-#### Configuration with multiple audio tracks
-
-```yaml
-mainSource:
-  videoTrack:
-    language: "en"
-    title: "Custom Video Title"  # Override default title
-  audioTracks:
-    - id: 1
-      language: "en"
-      title: "English"
-      default: true
-    - id: 2
+    - id: 1                       # ID from mkv-mux --identify
       language: "ja"
       title: "Japanese"
-      default: false
-    - id: 3
-      language: "fr"
-      title: "French"
-      default: false
-  additionalOptions:
-    - "--compression"
-    - "0:none"
-trackOrder: "0:0,0:1,0:2,0:3"
-```
-
-#### Configuration with an external subtitle file
-
-```yaml
-mainSource:
-  videoTrack:
-    language: "en"
-  audioTracks:
-    - id: 1
+      default: true
+  subtitleTracks:
+    - id: 4
       language: "en"
       title: "English"
       default: true
-additionalSources:
-  - file: "${fileName}.srt"
-    tracks:
-      - language: "en"
-        title: "English"
-        charset: "UTF-8"
-        default: true
-trackOrder: "0:0,0:1,1:0"
 ```
 
-### Key assumptions
-
-1. The first track in the main source will always contain a video track (track ID 0)
-2. Each additional source contains exactly one track (audio or subtitle, never video)
-3. Track ID 0 is assumed for all tracks in additional sources
+Omitting `audioTracks` or `subtitleTracks` copies no tracks of that type, and
+the output track order is derived from the config unless you set `trackOrder`
+explicitly. Every field — including `additionalSources` for merging external
+dubs and subtitles with per-episode `${fileName}` resolution — is covered in
+the [configuration reference](docs/reference.md#configuration).
 
 ## Tests
 
@@ -561,6 +384,13 @@ groovy src/test/run_tests.groovy --mkvmerge-exe /usr/bin/mkvmerge
 `mkvmerge` is auto-detected from PATH; use `--mkvmerge-exe` to override. Cases
 that need `mkvpropedit`, or a bare `groovy` on `PATH` for the wrapper smoke
 test, skip themselves with a printed note when those are unavailable.
+
+## Under the hood
+
+If you are curious about the details — the output and colour conventions, the
+full guide to reading the consistency check report, `to_utf8.groovy`'s safety
+rationale, and the complete `config.yaml` field reference — they live in
+[docs/reference.md](docs/reference.md).
 
 ## License
 

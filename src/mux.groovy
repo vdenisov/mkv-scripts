@@ -46,8 +46,8 @@ import java.nio.file.Paths
 @Field boolean checkVerbose = false
 
 @CommandLine.Option(names = ["--color"], paramLabel = "WHEN",
-                    description = "Highlight differing values in the check report: auto (default, only on a " +
-                                  "terminal), always, or never")
+                    description = "Colorize output: auto (default, only on a terminal and not under NO_COLOR), " +
+                                  "always, or never")
 @Field String colorMode = "auto"
 
 @CommandLine.Option(names = ["-x", "--exclude"], paramLabel = "PATTERN",
@@ -58,6 +58,15 @@ import java.nio.file.Paths
                         description = "File names or glob patterns to process; may be given more than once " +
                                       "(default: every file in the current directory)")
 @Field List<String> fileMasks = []
+
+// Shared console-output helpers (colours, error/warning forms), resolved
+// relative to this script's own location — never the CWD, which is the media
+// directory. Loaded explicitly by path rather than through Groovy's implicit
+// sibling-class resolution, which is CWD-dependent (see CLAUDE.md). First
+// script-body statement on purpose: closures below capture `ui` from their
+// enclosing scope, so it has to exist before any of them is defined.
+def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)
 
 // Config lives with the media: config.yaml in the current directory, or an
 // explicit --config path. There is deliberately no fall-back to a config beside
@@ -77,30 +86,19 @@ def config = null
 if (configFile.isFile()) {
     config = new Yaml().load(configFile.text)
 } else if (!inspecting) {
-    def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
     if (configPath) {
-        System.err.println "Config file not found: ${configFile.absolutePath}"
+        ui.error("Config file not found: ${configFile.absolutePath}")
     } else {
-        System.err.println "No config.yaml in the current directory (${new File('.').absoluteFile.parent})."
+        ui.error("No config.yaml in the current directory (${new File('.').absoluteFile.parent}).")
         System.err.println "Copy ${new File(scriptDir, 'config.example.yaml').absolutePath} next to your media"
         System.err.println "and edit it, or pass --config <path>."
     }
     System.exit(2)
 }
 
-// Locate an MKVToolNix executable: try PATH first, then the Windows default install location
-def findMkvTool = { String name ->
-    try {
-        def proc = [name, '--version'].execute()
-        proc.waitFor()
-        if (proc.exitValue() == 0) return name
-    } catch (ignored) {}
-    if (System.getProperty('os.name').toLowerCase().contains('win')) {
-        def path = "C:\\Program Files\\MKVToolNix\\${name}.exe"
-        if (new File(path).exists()) return path
-    }
-    throw new RuntimeException("'$name' not found on PATH or in default install location. Install MKVToolNix.")
-}
+// Locate an MKVToolNix executable: PATH first, then the Windows default
+// install location. Shared with the other scripts via tools.groovy.
+def findMkvTool = evaluate(new File(scriptDir, 'tools.groovy'))
 
 // Extract general settings from config. All are null-safe: when inspecting
 // without a config, destinationDir is unused (nothing is muxed), the extension
@@ -211,7 +209,7 @@ def probeFile = { File file ->
 
 // Print a readable track table for one file, for --identify.
 def identifyFile = { File file, Map info ->
-    println "*** ${file.name}"
+    ui.header("*** ${file.name}")
 
     if (info == null || !info.ok) {
         println "  (mkvmerge could not identify this file: ${info?.reason ?: 'unknown error'})"
@@ -226,8 +224,8 @@ def identifyFile = { File file, Map info ->
         return
     }
 
-    printf("  %-4s %-10s %-22s %-5s %-4s %-4s %s%n",
-           'ID', 'TYPE', 'CODEC', 'LANG', 'DEF', 'FOR', 'NAME')
+    println ui.cyan(String.format("  %-4s %-10s %-22s %-5s %-4s %-4s %s",
+                                  'ID', 'TYPE', 'CODEC', 'LANG', 'DEF', 'FOR', 'NAME'))
 
     tracks.each { track ->
         def props = track.get('properties') ?: [:]
@@ -367,15 +365,11 @@ def fitName = { String name, int width ->
     name.length() > width ? name[0..<(width - 3)] + '...' : name
 }
 
-def plural = { int n, String noun -> "${n} ${noun}${n == 1 ? '' : 's'}" }
+def plural = ui.plural
 
-// Highlight differing cells only when it will actually render: on a real
-// terminal by default, forced on/off with --color. System.console() is null when
-// output is piped or captured (including the test harness), so auto disables
-// itself there and never pollutes a redirected report or a test assertion.
-def colorEnabled = (colorMode == 'always') || (colorMode == 'auto' && System.console() != null)
-def ESC = (char) 27
-def hl = { String s -> colorEnabled ? "${ESC}[33m${s}${ESC}[0m" : s }   // yellow
+// The differing-cell highlight in the check tables. Terminal detection and the
+// --color/NO_COLOR gating live in output.groovy, shared with the other scripts.
+def hl = ui.yellow
 
 // A fixed-width table cell, padded *before* any colour is applied so the ANSI
 // escapes never count toward the width and break alignment.
@@ -394,8 +388,17 @@ def printMinority = { List<String> names, int limit ->
     if (!lines) return
     def markIdx = lines.findLastIndexOf { !it.contains('... and ') }
     if (markIdx < 0) markIdx = 0
-    lines[markIdx] = '           <- ' + lines[markIdx].substring(14)
-    lines.each { println it }
+    // The list is evidence, not primary data: gray, so the table rows stand
+    // out against it. The marker keeps the default foreground — its job is to
+    // stay findable inside the gray block — so this is the one place where a
+    // line holds two colour segments (still whole segments, never mid-word).
+    lines.eachWithIndex { line, i ->
+        if (i == markIdx) {
+            println('           <- ' + ui.gray(line.substring(14)))
+        } else {
+            println ui.gray(line)
+        }
+    }
 }
 
 // Row count is bounded by track count, not file count, so a 200-episode batch
@@ -408,7 +411,7 @@ def runConsistencyCheck = { List mediaFiles, Map infos ->
 
     def header = "*** Pre-flight check: ${ok.size()} file(s)"
     if (bad) header += " (${bad.size()} could not be identified by mkvmerge and are excluded)"
-    println header
+    ui.header(header)
     if (bad) {
         formatFileList(bad.collect { "${it.file.name} (${it.reason})".toString() }, '      ')
             .each { println it }
@@ -450,8 +453,8 @@ def runConsistencyCheck = { List mediaFiles, Map infos ->
     // repeat them per row.
     def printGroupTable = { List group, boolean isLargest ->
         def tgs = groupTracks(group)
-        println "    ${cell('ID', 4, false)} ${cell('TYPE', 6, false)} ${cell('CODEC', 20, false)} " +
-                "${cell('LANG', 5, false)} ${cell('DEF', 4, false)} ${cell('FOR', 4, false)} NAME"
+        println ui.cyan("    ${cell('ID', 4, false)} ${cell('TYPE', 6, false)} ${cell('CODEC', 20, false)} " +
+                        "${cell('LANG', 5, false)} ${cell('DEF', 4, false)} ${cell('FOR', 4, false)} NAME")
 
         // NAME is the last column, so it is not padded (no trailing whitespace);
         // it is the only cell that can be highlighted on its own here.
@@ -491,7 +494,7 @@ def runConsistencyCheck = { List mediaFiles, Map infos ->
         def uniform = groupTracks(group).every { it.consistent }
         if (multi) {
             def shape = group[0].tracks.sort { it.key }.collect { id, sig -> shortType(sig.type) }.join(', ')
-            println "*** Layout ${gi + 1} (${plural(group.size(), 'file')}): ${shape}"
+            ui.header("*** Layout ${gi + 1} (${plural(group.size(), 'file')}): ${shape}")
             // A uniform outlier group has no per-row split to hang its files on,
             // so list them together here. The largest group is the norm and is
             // never enumerated; a non-uniform outlier names its files per row.
@@ -528,7 +531,7 @@ def runConsistencyCheck = { List mediaFiles, Map infos ->
     // reported once regardless of layout.
     def duplicates = findDuplicates(ok)
     if (duplicates) {
-        println "*** Ambiguous track IDs"
+        ui.header("*** Ambiguous track IDs")
         duplicates.each { dup ->
             def name = dup.name ? "\"${dup.name}\"" : 'no name'
             println "    Tracks ${dup.ids.join(' and ')} are both ${dup.type} / ${dup.language} / " +
@@ -545,7 +548,7 @@ def runConsistencyCheck = { List mediaFiles, Map infos ->
     def withChapters = ok.findAll { it.chapters > 0 }
     def withoutChapters = ok.findAll { it.chapters == 0 }
     if (withChapters && withoutChapters) {
-        println "*** Chapters: present in ${withChapters.size()} file(s), absent in ${withoutChapters.size()}"
+        ui.header("*** Chapters: present in ${withChapters.size()} file(s), absent in ${withoutChapters.size()}")
         def minority = withChapters.size() < withoutChapters.size() ? withChapters : withoutChapters
         printMinority(minority.collect { it.file.name }, limit)
         informational << "chapters are present in some files and not others"
@@ -559,14 +562,14 @@ def runConsistencyCheck = { List mediaFiles, Map infos ->
     if (config == null) {
         def findings = blocking + informational
         if (findings) {
-            println "*** ${findings.size()} difference(s) across the batch (see the tables above)."
+            println ui.yellow("*** ${findings.size()} difference(s) across the batch (see the tables above).")
             println "***   Add a config.yaml, or --config <path>, to classify which affect selected tracks."
         } else {
-            println "*** Track structure is consistent across all ${ok.size()} file(s)."
+            ui.success("*** Track structure is consistent across all ${ok.size()} file(s).")
         }
     } else {
         if (blocking) {
-            println "*** ${blocking.size()} discrepanc${blocking.size() == 1 ? 'y affects a track' : 'ies affect tracks'} that config.yaml selects:"
+            println ui.yellow("*** ${blocking.size()} discrepanc${blocking.size() == 1 ? 'y affects a track' : 'ies affect tracks'} that config.yaml selects:")
             blocking.each { println "      ${it}" }
         }
         if (informational) {
@@ -574,7 +577,7 @@ def runConsistencyCheck = { List mediaFiles, Map infos ->
             informational.each { println "      ${it}" }
         }
         if (!blocking && !informational) {
-            println "*** Track structure is consistent across all ${ok.size()} file(s)."
+            ui.success("*** Track structure is consistent across all ${ok.size()} file(s).")
         }
     }
     println()
@@ -602,21 +605,21 @@ def validateTrackOrder = { String order ->
 
     def malformed = entries.findAll { !(it ==~ /^\d+:\d+$/) }
     if (malformed) {
-        println "*** Warning: trackOrder contains malformed entries: ${malformed.join(', ')}"
-        println "***          Expected comma-separated sourceIndex:trackId pairs, e.g. \"0:0,0:1,1:0\"."
+        ui.warn("trackOrder contains malformed entries: ${malformed.join(', ')}")
+        System.err.println ui.yellow("***          Expected comma-separated sourceIndex:trackId pairs, e.g. \"0:0,0:1,1:0\".")
     }
 
     def unknown = entries.findAll { it ==~ /^\d+:\d+$/ } - configured
     if (unknown) {
-        println "*** Warning: trackOrder references track IDs not configured: ${unknown.join(', ')}"
-        println "***          mkvmerge silently ignores unknown IDs, so these have no effect."
-        println "***          Check trackOrder against mainSource.audioTracks / subtitleTracks / additionalSources."
+        ui.warn("trackOrder references track IDs not configured: ${unknown.join(', ')}")
+        System.err.println ui.yellow("***          mkvmerge silently ignores unknown IDs, so these have no effect.")
+        System.err.println ui.yellow("***          Check trackOrder against mainSource.audioTracks / subtitleTracks / additionalSources.")
     }
 
     def missing = configured - entries
     if (missing) {
-        println "*** Warning: trackOrder omits configured track IDs: ${missing.join(', ')}"
-        println "***          These tracks are still muxed, but their position in the output is left to mkvmerge."
+        ui.warn("trackOrder omits configured track IDs: ${missing.join(', ')}")
+        System.err.println ui.yellow("***          These tracks are still muxed, but their position in the output is left to mkvmerge.")
     }
 }
 
@@ -834,9 +837,9 @@ if (excludeMatchers) {
 // A mask that matches nothing must say so. Falling through to a bare "Done"
 // after a typo'd pattern looks identical to a successful run that had no work.
 if ((fileMasks || excludeMasks) && !files) {
-    println "*** No files match: ${(fileMasks + excludeMasks.collect { "--exclude $it" }).join(', ')}"
+    println ui.yellow("*** No files match: ${(fileMasks + excludeMasks.collect { "--exclude $it" }).join(', ')}")
     println()
-    println "*** Done"
+    ui.success("*** Done")
     return
 }
 
@@ -862,7 +865,7 @@ if (companionSources && !identifyOnly) {
          }
 
     if (blocked) {
-        println "*** ${blocked.size()} file(s) will be skipped: companion files are missing"
+        println ui.yellow("*** ${blocked.size()} file(s) will be skipped: companion files are missing")
         missingBySource.each { pattern, names ->
             println "      ${pattern}  (missing for ${names.size()} file(s))"
             formatFileList(names, '        ').each { println it }
@@ -872,9 +875,9 @@ if (companionSources && !identifyOnly) {
         files = files.findAll { !blocked.contains(it.name) }
 
         if (!files.any { allowedExtensions.contains(FilenameUtils.getExtension(it.name.toLowerCase())) }) {
-            println "*** Nothing left to mux"
+            println ui.yellow("*** Nothing left to mux")
             println()
-            println "*** Done"
+            ui.success("*** Done")
             return
         }
     }
@@ -889,6 +892,21 @@ checkOnly = checkOnly || checkVerbose
 // per file. Probing first is essentially free, so the check runs by default.
 def mediaFiles = files.findAll {
     allowedExtensions.contains(FilenameUtils.getExtension(it.name.toLowerCase()))
+}
+
+// An empty batch must say why, in every mode. A bare green "Done" after
+// pointing the script at the wrong directory looks identical to a successful
+// run that had no work. (Masks that match nothing at all were already
+// reported above; this catches matches that are not media files.)
+if (!mediaFiles) {
+    if (fileMasks || excludeMasks) {
+        println ui.yellow("*** No media files match: ${(fileMasks + excludeMasks.collect { "--exclude $it" }).join(', ')}")
+    } else {
+        println ui.yellow("*** No media files (${allowedExtensions.sort().join(', ')}) in the current directory")
+    }
+    println()
+    ui.success("*** Done")
+    return
 }
 
 def wantCheck = checkOnly || (!identifyOnly && !noCheck)
@@ -909,9 +927,9 @@ if (mediaFiles && wantCheck) {
 }
 
 if (blockingCount > 0 && strict) {
-    println "*** Strict mode: aborting (${blockingCount} discrepanc${blockingCount == 1 ? 'y' : 'ies'} " +
-            "affecting selected tracks)."
-    println "*** Nothing was muxed. Fix config.yaml or the inputs, or drop --strict to continue."
+    System.err.println ui.red("*** Strict mode: aborting (${blockingCount} discrepanc${blockingCount == 1 ? 'y' : 'ies'} " +
+                              "affecting selected tracks).")
+    System.err.println ui.red("*** Nothing was muxed. Fix config.yaml or the inputs, or drop --strict to continue.")
     System.exit(2)
 }
 
@@ -919,7 +937,7 @@ if (blockingCount > 0 && strict) {
 // through to the loop below, which prints the per-file tables and then returns
 // before muxing because identifyOnly is set.
 if (checkOnly && !identifyOnly) {
-    println "*** Done"
+    ui.success("*** Done")
     return
 }
 
@@ -927,7 +945,7 @@ Process proc = null
 
 addShutdownHook {
     if (proc != null) {
-        println "Killing mkvtoolnix process ${-> proc.pid()}"
+        println "*** Killing mkvtoolnix process ${-> proc.pid()}"
         proc.destroy()
     }
 }
@@ -949,7 +967,7 @@ files.forEach { file ->
                 return
             }
 
-            println "*** Processing ${file.name}"
+            ui.header("*** Processing ${file.name}")
             println()
 
             fileName = FilenameUtils.getBaseName(file.name)
@@ -973,7 +991,7 @@ files.forEach { file ->
 
             if (proc.exitValue() != 0) {
                 println()
-                println "*** Error: ${proc.exitValue()}"
+                ui.error("mkvmerge exited with code ${proc.exitValue()}")
             }
 
             proc = null
@@ -984,4 +1002,4 @@ files.forEach { file ->
 }
 
 println()
-println "*** Done"
+ui.success("*** Done")

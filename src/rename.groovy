@@ -19,6 +19,16 @@ import picocli.groovy.PicocliScript2
 @CommandLine.Option(names = ["-n", "--dry-run"], description = "Print planned renames without touching any files")
 @Field boolean dryRun = false
 
+@CommandLine.Option(names = ["--color"], paramLabel = "WHEN",
+                    description = "Colorize output: auto (default, only on a terminal and not under NO_COLOR), " +
+                                  "always, or never")
+@Field String colorMode = "auto"
+
+// Shared console-output helpers, resolved relative to this script's own
+// location — see output.groovy for why they are loaded explicitly by path.
+def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
+def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)
+
 def extensions = [".mkv", ".mp4", ".avi", ".srt", ".ass", ".mks", ".idx", ".sub", ".mka"] as String[]
 
 // Deliberately no explicit charset: Groovy's no-arg reader runs CharsetToolkit
@@ -75,22 +85,25 @@ duplicates.each { name, entries ->
 }
 
 if (problems) {
-    println "*** Refusing to rename anything, ${problems.size()} problem(s) found:"
-    problems.each { println "  - ${it}" }
+    // The whole report goes to stderr, preview included: splitting one report
+    // across two streams scrambles its line order under buffering when both
+    // are redirected to the same place.
+    ui.error("Refusing to rename anything, ${problems.size()} problem(s) found:")
+    problems.each { System.err.println "  - ${it}" }
 
     // Still show what the rest of the batch would have done, so the scope of
     // what is blocked is visible rather than having to be inferred
     if (plan) {
-        println()
-        println "*** The other ${plan.size()} file(s) would have been renamed:"
-        plan.each { println "  '${it.file.name}' -> '${it.newName}'" }
+        System.err.println()
+        System.err.println "*** The other ${plan.size()} file(s) would have been renamed:"
+        plan.each { System.err.println "  '${it.file.name}' -> '${it.newName}'" }
     }
 
     System.exit(1)
 }
 
 if (!plan) {
-    println "*** Nothing to rename"
+    println ui.yellow("*** Nothing to rename")
     return
 }
 
@@ -100,22 +113,26 @@ plan.each { entry ->
     if (dryRun) {
         println "'${entry.file.name}' -> '${entry.newName}'"
     } else {
-        println "Renaming '${entry.file.name}'"
-        println "to '${entry.newName}'"
+        // Both lines are one logical header, so both carry the header colour
+        ui.header("*** Renaming '${entry.file.name}'")
+        ui.header("***       to '${entry.newName}'")
         if (!entry.file.renameTo(new File(entry.file.parentFile, entry.newName))) {
-            println "*** Error: could not rename '${entry.file.name}'"
+            ui.error("could not rename '${entry.file.name}'")
             failed++
         }
     }
 }
 
+// The summary is the batch's result, so it stays on stdout in both colours;
+// the per-file errors already went to stderr as they happened.
+println()
 if (dryRun) {
-    println()
     println "*** Dry run: ${plan.size()} file(s) would be renamed, nothing changed"
 } else if (failed > 0) {
-    println()
-    println "*** ${failed} of ${plan.size()} file(s) could not be renamed"
+    println ui.red("*** ${plan.size() - failed} renamed, ${failed} failed")
     System.exit(1)
+} else {
+    ui.success("*** ${plan.size()} file(s) renamed")
 }
 
 /** Season and episode numbers from a file name, or null when absent. */
