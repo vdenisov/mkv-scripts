@@ -15,6 +15,7 @@ current directory, and is small enough to read and adapt in a few minutes.
 
 ```
 mkv-mux --identify        # what tracks does this file have?
+mkv-mux --check           # are all the episodes structured the same?
 mkv-mux --dry-run         # what would be muxed, exactly?
 mkv-mux                   # do it
 ```
@@ -127,11 +128,7 @@ in `src/themoviedb.http`.
 
 Failures are reported rather than thrown: a bad key, an unknown show or a
 nonexistent season prints TheMovieDB's own message and exits non-zero.
-
-`episodes.txt` is written as UTF-8 explicitly, so non-Latin titles survive
-regardless of the JVM's default charset. `rename.groovy` reads it back without
-forcing a charset, which lets Groovy auto-detect UTF-8 while still handling an
-`episodes.txt` assembled by hand in an editor that saved it as something else.
+`episodes.txt` is written as UTF-8, so non-Latin titles survive.
 
 ### rename.groovy
 
@@ -166,11 +163,10 @@ groovy src/mux.groovy "Show.S01E0[12].mkv"     # only the files matching a patte
 groovy src/mux.groovy --exclude "*.sample.mkv" # everything except the files matching a pattern
 ```
 
-Reads `config.yaml` (current directory first, then the copy next to the
-script), discovers all files in the current directory matching
-`allowedExtensions`, and runs `mkvmerge` for each one. Output goes to
-`destinationDir`. If a file fails, the error is printed and processing continues
-with the next file. See [Configuration](#configuration) below.
+Reads `config.yaml` (see [Configuration](#configuration) below), discovers all
+files in the current directory matching `allowedExtensions`, and runs `mkvmerge`
+for each one. Output goes to `destinationDir`. If a file fails, the error is
+printed and processing continues with the next file.
 
 #### Selecting a subset of the files
 
@@ -185,14 +181,11 @@ groovy src/mux.groovy Show.S01E01.mkv Show.S01E03.mkv        # several files
 groovy src/mux.groovy "Show.S01E*.mkv" --exclude "*.sample.mkv"
 ```
 
-Quote your patterns. Unix shells expand `*.mkv` before the script runs, which
-works, but quoting keeps the behaviour identical to Windows — where `cmd.exe`
-passes the pattern through and the script expands it itself. A pattern that
-exactly names an existing file is always taken literally, so a file called
-`Odd[1].mkv` selects only itself rather than being read as a character class.
-
-A pattern that matches nothing is reported rather than silently doing nothing,
-so a typo does not look like a successful run with no work to do.
+Quote your patterns so the behaviour is identical across shells (the script
+expands globs itself). A pattern that exactly names an existing file is taken
+literally, so a file called `Odd[1].mkv` selects only itself rather than being
+read as a character class. A pattern that matches nothing is reported, so a typo
+does not look like a successful run with no work to do.
 
 #### Companion file pre-flight
 
@@ -223,7 +216,8 @@ at that ID, and you discover the wrong dub at playback time.
 
 The consistency check compares track structure across the whole batch and reports
 it before muxing. It runs automatically (skip it with `--no-check`), or on its own
-with `--check`, which muxes nothing. `--check` and `--identify` can be combined —
+with `--check`, which muxes nothing and needs no `config.yaml` — so you can inspect
+a season's structure before writing one. `--check` and `--identify` can be combined;
 they answer different questions and share one `mkvmerge` scan.
 
 It works in two layers. First it groups files by **track layout** — the type at
@@ -241,12 +235,12 @@ row per distinct value and naming the files that carry it:
     0    video  AVC/H.264/MPEG-4p10  eng   yes  no   -
     1    audio  AC-3                 eng   yes  no   (no name)
     2    subs   SubRip/SRT           eng   yes  no   English (SDH)
-           <- Show.S01E16 - Any Wounded Thief.mkv
+           <- Show.S01E16 - Episode Sixteen.mkv
     2    subs   SubRip/SRT           eng   no   no   English (SDH)
 
 *** Layout 2 (2 files): subs, video, audio
-           <- Show.S01E18 - One Begets Technique.mkv
-              Show.S01E20 - Swift Hardhearted Stone.mkv
+              Show.S01E18 - Episode Eighteen.mkv
+           <- Show.S01E20 - Episode Twenty.mkv
     ID   TYPE   CODEC                LANG  DEF  FOR  NAME
     0    subs   SubRip/SRT           eng   yes  no   (no name)
     1    video  AVC/H.264/MPEG-4p10  eng   yes  no   -
@@ -266,11 +260,8 @@ How to read it:
   as a 3-episode one. Every track is listed, so the table doubles as the map you
   check `config.yaml`'s IDs against. The `DEF`/`FOR` columns make a flag-only
   difference legible, and on a terminal the differing cell is highlighted.
-- **The `<-` names the files that deviate**, one per line. In the common group the
-  majority row is the unnamed reference and only the minorities are named — the
-  tool never assumes the first file is the reference, so a translation dropped from
-  episode 9 on flags those files, not the majority. An even split names both sides;
-  an outlier group names all of its files.
+- **The `<-` names only the files that deviate**, one per line; the majority is the
+  unnamed reference.
 - **Blocking vs informational.** A difference only corrupts output when it lands on
   a track the config selects by ID *and* not every track of that type is being
   copied. Everything else — unselected tracks, chapters, a type copied wholesale —
@@ -367,9 +358,8 @@ Three things make it safe to point at a directory more than once:
   in the source charset, so a wrong `--encoding` would otherwise succeed quietly
   and produce mojibake. Instead the file is reported and left alone, and the run
   exits non-zero.
-- **UTF-16 input is refused.** Every byte of a UTF-16 file maps to *something* in
-  a single-byte charset, so a strict decode alone would happily write the
-  mojibake back.
+- **UTF-16 input is detected and skipped** — otherwise it would decode to
+  mojibake that looks valid.
 
 `.sub` is deliberately excluded: the extension is ambiguous between MicroDVD text
 and the binary half of a VobSub `.idx`/`.sub` pair, and rewriting the binary one

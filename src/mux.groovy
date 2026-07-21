@@ -65,8 +65,18 @@ import java.nio.file.Paths
 // silently applying it to whatever directory you are in produced confidently
 // wrong output (its track selections never match). Copy it next to your media,
 // or point --config at your own.
+//
+// The inspection modes (--identify, --check, --check-verbose) describe the files
+// as they are and do not mux, so they run without a config — useful for checking
+// a season's structure before writing the config against it. Only a run that
+// actually muxes requires one. (--check-verbose implies --check, but the
+// checkOnly reassignment for that happens later, so it is named here directly.)
+def inspecting = identifyOnly || checkOnly || checkVerbose
 def configFile = configPath ? new File(configPath) : new File("config.yaml")
-if (!configFile.isFile()) {
+def config = null
+if (configFile.isFile()) {
+    config = new Yaml().load(configFile.text)
+} else if (!inspecting) {
     def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
     if (configPath) {
         System.err.println "Config file not found: ${configFile.absolutePath}"
@@ -77,7 +87,6 @@ if (!configFile.isFile()) {
     }
     System.exit(2)
 }
-def config = new Yaml().load(configFile.text)
 
 // Locate an MKVToolNix executable: try PATH first, then the Windows default install location
 def findMkvTool = { String name ->
@@ -93,10 +102,14 @@ def findMkvTool = { String name ->
     throw new RuntimeException("'$name' not found on PATH or in default install location. Install MKVToolNix.")
 }
 
-// Extract general settings from config
-def destinationDir = config.general.destinationDir
-def allowedExtensions = config.general.allowedExtensions as Set
-def mkvmergeExe = (config.general.containsKey('mkvmergeExe') && config.general.mkvmergeExe)
+// Extract general settings from config. All are null-safe: when inspecting
+// without a config, destinationDir is unused (nothing is muxed), the extension
+// filter falls back to the common video containers so there is still something
+// to inspect, and mkvmergeExe is auto-detected from PATH.
+def DEFAULT_EXTENSIONS = ['mkv', 'mp4', 'm4v', 'avi', 'mov', 'ts', 'm2ts', 'webm', 'mka', 'mks'] as Set
+def destinationDir = config?.general?.destinationDir
+def allowedExtensions = (config?.general?.allowedExtensions as Set) ?: DEFAULT_EXTENSIONS
+def mkvmergeExe = (config?.general?.containsKey('mkvmergeExe') && config.general.mkvmergeExe)
     ? config.general.mkvmergeExe
     : findMkvTool('mkvmerge')
 
@@ -307,13 +320,15 @@ def findDuplicates = { List infos ->
 // by ID. If every track of that type is being copied, IDs cannot select the
 // wrong thing, so the difference is informational. buildCommandLine hardcodes
 // 0: for video, hence the fixed video ID below.
-def selectedVideoIds = [0] as Set
-def selectedAudioIds = (config.mainSource.audioTracks ?: []).collect { it.id as Integer } as Set
-def selectedSubIds = (config.mainSource.subtitleTracks ?: []).collect { it.id as Integer } as Set
+// Empty when inspecting without a config: nothing is "selected", so the check
+// prints structure only and skips the blocking/informational classification.
+def selectedVideoIds = config ? ([0] as Set) : ([] as Set)
+def selectedAudioIds = (config?.mainSource?.audioTracks ?: []).collect { it.id as Integer } as Set
+def selectedSubIds = (config?.mainSource?.subtitleTracks ?: []).collect { it.id as Integer } as Set
 def selectedIds = selectedVideoIds + selectedAudioIds + selectedSubIds
 
 def configTitleFor = { Integer id ->
-    ((config.mainSource.audioTracks ?: []) + (config.mainSource.subtitleTracks ?: []))
+    ((config?.mainSource?.audioTracks ?: []) + (config?.mainSource?.subtitleTracks ?: []))
         .find { (it.id as Integer) == id }?.title
 }
 
@@ -369,13 +384,17 @@ def cell = { value, int width, boolean diff ->
     diff ? hl(s) : s
 }
 
-// Print a file list under a "<-" marker that appears on the first line only;
-// wrapped continuation lines align under it without repeating the arrow, so a
-// two-line list does not read as two separate groups.
+// Print a file list with the "<-" marker on the last named file, since the list
+// sits above the row it describes — the marker adjacent to that row reads more
+// clearly than one at the top, next to the unrelated row above. The rest of the
+// list is a plain hanging indent, so a multi-line list is not mistaken for
+// several groups. The "... and N more" summary (if any) stays below the marker.
 def printMinority = { List<String> names, int limit ->
     def lines = formatFileList(names, '              ', limit)   // 14-space hanging indent
     if (!lines) return
-    lines[0] = '           <- ' + lines[0].substring(14)
+    def markIdx = lines.findLastIndexOf { !it.contains('... and ') }
+    if (markIdx < 0) markIdx = 0
+    lines[markIdx] = '           <- ' + lines[markIdx].substring(14)
     lines.each { println it }
 }
 
@@ -533,16 +552,30 @@ def runConsistencyCheck = { List mediaFiles, Map infos ->
         println()
     }
 
-    if (blocking) {
-        println "*** ${blocking.size()} discrepanc${blocking.size() == 1 ? 'y affects a track' : 'ies affect tracks'} that config.yaml selects:"
-        blocking.each { println "      ${it}" }
-    }
-    if (informational) {
-        println "*** ${informational.size()} informational (does not affect what gets muxed):"
-        informational.each { println "      ${it}" }
-    }
-    if (!blocking && !informational) {
-        println "*** Track structure is consistent across all ${ok.size()} file(s)."
+    // Without a config there is nothing to classify against, so report the count
+    // of differences (already detailed in the tables above) and point at how to
+    // classify them. The per-item labels assume selected tracks, so they are only
+    // printed when a config is present.
+    if (config == null) {
+        def findings = blocking + informational
+        if (findings) {
+            println "*** ${findings.size()} difference(s) across the batch (see the tables above)."
+            println "***   Add a config.yaml, or --config <path>, to classify which affect selected tracks."
+        } else {
+            println "*** Track structure is consistent across all ${ok.size()} file(s)."
+        }
+    } else {
+        if (blocking) {
+            println "*** ${blocking.size()} discrepanc${blocking.size() == 1 ? 'y affects a track' : 'ies affect tracks'} that config.yaml selects:"
+            blocking.each { println "      ${it}" }
+        }
+        if (informational) {
+            println "*** ${informational.size()} informational (does not affect what gets muxed):"
+            informational.each { println "      ${it}" }
+        }
+        if (!blocking && !informational) {
+            println "*** Track structure is consistent across all ${ok.size()} file(s)."
+        }
     }
     println()
 
@@ -587,15 +620,20 @@ def validateTrackOrder = { String order ->
     }
 }
 
-// Resolve once, not per file, so the warnings are printed only once
+// Resolve once, not per file, so the warnings are printed only once. Only needed
+// (and only possible) when muxing — the inspection modes neither build a command
+// line nor necessarily have a config, and the "derived order" note is just noise
+// for them.
 def effectiveTrackOrder
-if (config.containsKey('trackOrder') && config.trackOrder) {
-    effectiveTrackOrder = config.trackOrder.toString()
-    validateTrackOrder(effectiveTrackOrder)
-} else {
-    effectiveTrackOrder = deriveTrackOrder()
-    println "*** trackOrder not configured; using derived order: ${effectiveTrackOrder}"
-    println()
+if (!inspecting) {
+    if (config.containsKey('trackOrder') && config.trackOrder) {
+        effectiveTrackOrder = config.trackOrder.toString()
+        validateTrackOrder(effectiveTrackOrder)
+    } else {
+        effectiveTrackOrder = deriveTrackOrder()
+        println "*** trackOrder not configured; using derived order: ${effectiveTrackOrder}"
+        println()
+    }
 }
 
 def fileName = null
@@ -807,7 +845,7 @@ if ((fileMasks || excludeMasks) && !files) {
 // mkvmerge failure partway through a long batch. Check them all up front and
 // drop just the affected episodes: those would have failed anyway, and the rest
 // of the batch is still worth muxing.
-def companionSources = config.additionalSources ?: []
+def companionSources = config?.additionalSources ?: []
 if (companionSources && !identifyOnly) {
     def missingBySource = new LinkedHashMap()
     def blocked = [] as Set

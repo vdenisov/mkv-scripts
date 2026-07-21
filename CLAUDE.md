@@ -8,7 +8,7 @@ A Groovy toolkit for automating MKV video file workflows — primarily for TV sh
 
 ## Running scripts
 
-All scripts operate on the current working directory — in practice the directory containing the media files. `mux.groovy` reads `config.yaml` from the CWD (per-show config next to the media files) or from an explicit `--config <path>`; there is **no** fallback to a config next to the script. The repo ships `src/config.example.yaml` as a template — it is never auto-loaded, because silently applying a demo config's track selections to an unrelated directory produced confidently wrong output (a wrong `config title` on the `--check` verdict was the giveaway). A missing config is a clean exit-2 error pointing at the template, not a stack trace. Only the test suite is run from the repo root:
+All scripts operate on the current working directory — in practice the directory containing the media files. `mux.groovy` reads `config.yaml` from the CWD (per-show config next to the media files) or from an explicit `--config <path>`; there is **no** fallback to a config next to the script. The repo ships `src/config.example.yaml` as a template — it is never auto-loaded, because silently applying a demo config's track selections to an unrelated directory produced confidently wrong output (a wrong `config title` on the `--check` verdict was the giveaway). The inspection modes (`--identify`, `--check`, `--check-verbose`) run **without** a config; only a muxing run requires one, and a muxing run with no config is a clean exit-2 error pointing at the template, not a stack trace. Only the test suite is run from the repo root:
 
 ```bash
 groovy src/mux.groovy                                       # Main muxer — reads config.yaml (CWD) or --config PATH
@@ -39,7 +39,7 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 80 tests
+groovy src/test/run_tests.groovy              # Run all 81 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```
@@ -83,7 +83,7 @@ TheMovieDB API
 
 ## `mux.groovy` internals
 
-`mux.groovy` is the core script. It reads `config.yaml` (CWD first, then the script's own directory), discovers all files in the current directory matching `allowedExtensions`, and for each file constructs and executes an `mkvmerge` command.
+`mux.groovy` is the core script. It reads `config.yaml` from the CWD (or `--config <path>`), discovers all files in the current directory matching `allowedExtensions`, and for each file constructs and executes an `mkvmerge` command.
 
 **Critical pattern:** all helpers in `mux.groovy` must be closures (`def foo = { ... }`), not methods (`def foo() { ... }`). Groovy methods on a Script class cannot access `def`-declared local variables from the script body — closures can because they capture their enclosing scope. `buildCommandLine` is defined as a closure for this reason.
 
@@ -107,9 +107,11 @@ Output specifics that were hard-won in review: the differing cell is highlighted
 
 `findDuplicates` flags only genuinely ambiguous same-language tracks (type+language+codec+name all equal). Classification: a layout outlier is blocking when it changes the type at a selected ID or drops one; a per-ID value discrepancy is blocking via `isBlocking` (selected ID *and* `copiesAllOfType` false). `--strict` exits 2 on any blocking finding; default warns and continues. `--check` alone returns before muxing; `--check --identify` falls through to the identify loop, which prints per-file tables then returns before muxing because `identifyOnly` is set.
 
+**Config is optional for the inspection modes** (`inspecting = identifyOnly || checkOnly || checkVerbose`, computed before the config load so it can gate it). `config` may be `null`: `allowedExtensions` falls back to `DEFAULT_EXTENSIONS`, `mkvmergeExe` to PATH auto-detect, `selectedIds` to empty, and every other config access is null-safe (`config?.…`). With no config `runConsistencyCheck` prints the structural report plus a difference count but skips the blocking/informational classification (there are no selected tracks to classify against). The trackOrder resolution is also gated on `!inspecting` — it is only needed for the command line and would otherwise NPE.
+
 **`mkvmerge -J` exits 0 on a file it cannot read** — it signals failure through `container.recognized`/`container.supported`, not the exit code. `probeFile` checks those; relying on the exit code alone would let a corrupt file into the comparison as a file with zero tracks, which reads as "every track is absent here" and poisons the whole report.
 
-**Companion pre-flight.** Before muxing (and before `--dry-run` previews, but not `--identify`), every `additionalSources` path is resolved per episode and checked for existence. Episodes with missing companions are reported and dropped from the batch; the rest still mux. This never aborts — those episodes would have failed in mkvmerge anyway, and a partially-released dub is a normal situation. The check runs before the `destinationDir` `mkdirs()`, so a fully-blocked batch leaves no empty output directory behind. `formatFileList` wraps and truncates the name lists (ASCII only — this output reaches Windows consoles on legacy codepages); `--check` in item 3 reuses it.
+**Companion pre-flight.** Before muxing (and before `--dry-run` previews, but not `--identify`), every `additionalSources` path is resolved per episode and checked for existence. Episodes with missing companions are reported and dropped from the batch; the rest still mux. This never aborts — those episodes would have failed in mkvmerge anyway, and a partially-released dub is a normal situation. The check runs before the `destinationDir` `mkdirs()`, so a fully-blocked batch leaves no empty output directory behind. `formatFileList` (one file name per line, truncated past a limit, ASCII only — this output reaches Windows consoles on legacy codepages) is shared with the `--check` report.
 
 ## `bin/` wrappers
 
@@ -137,4 +139,4 @@ Omitting `audioTracks` or `subtitleTracks` (or setting them to `[]`) causes no t
 
 ## Platform notes
 
-The scripts are cross-platform: `mkvmerge` and `mkvpropedit` are resolved from PATH, with a fallback to the default Windows install location (`C:\Program Files\MKVToolNix\`). The project originated on Windows, which shows in a few places: the sample `mkvmergeExe` value in `config.yaml` uses a Windows path, `fetch_episodes.groovy` strips characters invalid in Windows file names, and `to_utf8.groovy` exists specifically for Windows-1251-encoded subtitle sources. CI runs the test suite on Linux.
+The scripts are cross-platform: `mkvmerge` and `mkvpropedit` are resolved from PATH, with a fallback to the default Windows install location (`C:\Program Files\MKVToolNix\`). The project originated on Windows, which shows in a few places: the sample `mkvmergeExe` value in `config.example.yaml` uses a Windows path, `fetch_episodes.groovy` strips characters invalid in Windows file names, and `to_utf8.groovy` defaults its source encoding to Windows-1251 (though `--encoding` accepts any charset). CI runs the test suite on Linux.

@@ -1743,14 +1743,14 @@ runTest('78_check_verbose_does_not_mux') { workDir ->
     check(!new File(workDir, 'mkv').exists(), 'no output directory created')
 }
 
-// ─── 79. a missing config.yaml is a clean error, not a stack trace ───────────
+// ─── 79. a muxing run with no config.yaml is a clean error, not a stack trace ─
 // The script no longer falls back to the example config next to itself, so a
 // media directory with no config gets told what to do rather than silently
-// muxing with unrelated selections.
+// muxing with unrelated selections. (--check is exempt; see test 81.)
 runTest('79_missing_config_clean_error') { workDir ->
     stageInput(workDir, 'E01.mkv')   // media present, but no config.yaml
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
-    checkEquals(code, 2, 'exits 2 when no config is found')
+    def (code, out) = runMkvGroovy(workDir, ['--dry-run'])
+    checkEquals(code, 2, 'exits 2 when a muxing run finds no config')
     check(out.contains('No config.yaml'), 'explains the problem')
     check(out.contains('config.example.yaml'), 'points at the shipped template')
     check(!out.contains('Exception'), 'no stack trace')
@@ -1766,6 +1766,23 @@ runTest('80_explicit_config_path') { workDir ->
     def (code, out) = runMkvGroovy(workDir, ['--check', '--config', 'configs/show.yaml'])
     checkEquals(code, 0, "exit code (output was:\n$out\n)")
     check(out.contains('Pre-flight check: 1 file'), 'ran the check using the pointed-at config')
+}
+
+// ─── 81. --check runs without a config, reporting structure but not classifying ─
+// Useful before a config exists: check a season is consistent, then write the
+// config against it. Only a muxing run needs the config.
+runTest('81_check_without_config') { workDir ->
+    fullCopy(new File(workDir, 'a.mkv'))
+    fullCopy(new File(workDir, 'b.mkv'), [names: [2: 'Other Studio']])
+    // deliberately no config.yaml
+
+    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(out.contains('Pre-flight'), 'the structural report still runs')
+    check(out.contains('difference(s) across the batch'), 'counts the differences it found')
+    check(out.contains('Add a config'), 'notes that classifying them needs a config')
+    check(!out.contains('config.yaml selects'), 'no blocking classification without a config')
+    check(!new File(workDir, 'mkv').exists(), 'still muxes nothing')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
