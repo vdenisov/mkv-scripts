@@ -15,6 +15,7 @@ current directory, and is small enough to read and adapt in a few minutes.
 
 ```
 mkv-mux --identify        # what tracks does this file have?
+mkv-mux --check           # are all the episodes structured the same?
 mkv-mux --dry-run         # what would be muxed, exactly?
 mkv-mux                   # do it
 ```
@@ -95,20 +96,20 @@ wrappers elsewhere, as the shell wrappers do not resolve symlinks.
 
 All scripts operate on the current working directory — run them from the
 directory containing your media files (via the `bin/` wrappers above, or
-`groovy <path-to-repo>/src/<script>.groovy`). `mux.groovy` looks for
-`config.yaml` in the current directory first — a per-show config dropped next
-to the media files — and falls back to the `config.yaml` next to the script
-(`src/config.yaml` in this repo). Only the test suite is run from the repo
-root:
+`groovy <path-to-repo>/src/<script>.groovy`). `mux.groovy` reads `config.yaml`
+from the current directory — a per-show config dropped next to the media files —
+or from an explicit `--config <path>`. The repo ships `src/config.example.yaml`
+as a template to copy and edit; it is never loaded automatically. Only the test
+suite is run from the repo root:
 
 | Script | Purpose |
 |--------|---------|
-| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--dry-run` prints commands without running them. |
+| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--check` compares track structure across the batch, `--dry-run` prints commands without running them, and file names or globs (plus `--exclude`) narrow the batch. |
 | `fetch_episodes.groovy` | Fetches episode names for a show/season from TheMovieDB and writes `episodes.txt`. |
 | `rename.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
 | `propedit.groovy` | Batch-runs `mkvpropedit` over every MKV in the current directory, passing your arguments through — fix any property (track names, forced/default flags, …) without a full remux. |
-| `to_utf8.groovy` | Converts `.srt` files from Windows-1251 to UTF-8 (writes `<name>.utf8.srt`). |
+| `to_utf8.groovy` | Converts `.srt`/`.ass`/`.ssa`/`.vtt` subtitles to UTF-8 in place, from `--encoding` (default Windows-1251). Skips files that are already UTF-8; `--backup` keeps the originals. |
 | `fix_srt.groovy` | Converts subtitles in a non-standard timing format into valid SRT (writes `<name>.srt.fixed`). |
 | `find_unused_fonts.groovy` | Lists font files in `fonts/` that are not referenced by any `.ass` subtitle in the current directory. |
 
@@ -118,10 +119,16 @@ root:
 groovy src/fetch_episodes.groovy --show-id 2260 --season 1 [--api-key KEY]
 ```
 
-If `--api-key` is not supplied, the key is read from `apikey.txt` in the current
-directory. Episode names are written to `episodes.txt`, one per line, with
-characters invalid in Windows file names stripped. Endpoint examples live in
-`src/themoviedb.http`.
+If `--api-key` is not supplied, the key is read from `apikey.txt` — the current
+directory first, then the copy next to the script, so the key does not have to be
+copied into every media directory. Episode names are written to `episodes.txt`,
+one per line, with characters invalid in Windows file names stripped, along with
+any trailing dots and spaces (which Windows also rejects). Endpoint examples live
+in `src/themoviedb.http`.
+
+Failures are reported rather than thrown: a bad key, an unknown show or a
+nonexistent season prints TheMovieDB's own message and exits non-zero.
+`episodes.txt` is written as UTF-8, so non-Latin titles survive.
 
 ### rename.groovy
 
@@ -148,16 +155,131 @@ be untangled by hand.
 ### mux.groovy
 
 ```
-groovy src/mux.groovy              # mux every matching file
-groovy src/mux.groovy --identify   # list tracks per file, mux nothing
-groovy src/mux.groovy --dry-run    # print the mkvmerge command per file, run nothing
+groovy src/mux.groovy                          # check, then mux every matching file
+groovy src/mux.groovy --identify               # list tracks per file, mux nothing
+groovy src/mux.groovy --check                  # compare tracks across files, mux nothing
+groovy src/mux.groovy --dry-run                # print the mkvmerge command per file, run nothing
+groovy src/mux.groovy "Show.S01E0[12].mkv"     # only the files matching a pattern
+groovy src/mux.groovy --exclude "*.sample.mkv" # everything except the files matching a pattern
 ```
 
-Reads `config.yaml` (current directory first, then the copy next to the
-script), discovers all files in the current directory matching
-`allowedExtensions`, and runs `mkvmerge` for each one. Output goes to
-`destinationDir`. If a file fails, the error is printed and processing continues
-with the next file. See [Configuration](#configuration) below.
+Reads `config.yaml` (see [Configuration](#configuration) below), discovers all
+files in the current directory matching `allowedExtensions`, and runs `mkvmerge`
+for each one. Output goes to `destinationDir`. If a file fails, the error is
+printed and processing continues with the next file.
+
+#### Selecting a subset of the files
+
+Positional arguments narrow the batch to the files you name; `--exclude` drops
+files from it. Both accept an exact file name or a glob, both may be repeated,
+and both apply in every mode — including `--identify` and `--dry-run`. With no
+arguments the behaviour is unchanged: every file in the directory.
+
+```
+groovy src/mux.groovy Show.S01E03.mkv                        # one file
+groovy src/mux.groovy Show.S01E01.mkv Show.S01E03.mkv        # several files
+groovy src/mux.groovy "Show.S01E*.mkv" --exclude "*.sample.mkv"
+```
+
+Quote your patterns so the behaviour is identical across shells (the script
+expands globs itself). A pattern that exactly names an existing file is taken
+literally, so a file called `Odd[1].mkv` selects only itself rather than being
+read as a character class. A pattern that matches nothing is reported, so a typo
+does not look like a successful run with no work to do.
+
+#### Companion file pre-flight
+
+When `additionalSources` uses the `${fileName}` placeholder, every companion is
+checked for existence before anything is muxed. Episodes whose companions are
+missing are named and skipped; the rest of the batch is muxed normally.
+
+```
+*** 2 file(s) will be skipped: companion files are missing
+      ${fileName}[Studio].mka  (missing for 2 file(s))
+        Show.S01E13.mkv, Show.S01E14.mkv
+```
+
+A dub or subtitle release covering only part of a season is routine. Without the
+check that surfaces as an mkvmerge failure partway through a long batch; with it,
+the gaps are visible before the first mux and the complete episodes still get
+processed. Those episodes would have failed anyway, so nothing is lost by
+skipping them — this never aborts the run. If every episode is blocked, the run
+says so instead of printing a bare `Done`.
+
+#### Consistency check
+
+`config.yaml` selects tracks by **numeric ID**, which quietly assumes every
+episode in the directory has the same track layout. When that breaks — a
+translation added mid-season, an old one dropped, a different release group
+ordering tracks differently — mkvmerge does not complain; it muxes whatever sits
+at that ID, and you discover the wrong dub at playback time.
+
+The consistency check compares track structure across the whole batch and reports
+it before muxing. It runs automatically (skip it with `--no-check`), or on its own
+with `--check`, which muxes nothing and needs no `config.yaml` — so you can inspect
+a season's structure before writing one. `--check` and `--identify` can be combined;
+they answer different questions and share one `mkvmerge` scan.
+
+It works in two layers. First it groups files by **track layout** — the type at
+each ID. Files that share a layout are the same release and get one table; files
+whose layout differs (a different track order, or a track missing) are a different
+release and get their own, largest group first. This keeps a shifted-track-order
+release from being smeared across the per-ID table, where the same file would
+otherwise appear at every shifted ID. Then, within each group, it compares the
+**values** at each ID — codec, language, name, default/forced flags — stacking a
+row per distinct value and naming the files that carry it:
+
+```
+*** Layout 1 (20 files): video, audio, subs
+    ID   TYPE   CODEC                LANG  DEF  FOR  NAME
+    0    video  AVC/H.264/MPEG-4p10  eng   yes  no   -
+    1    audio  AC-3                 eng   yes  no   (no name)
+    2    subs   SubRip/SRT           eng   yes  no   English (SDH)
+           <- Show.S01E16 - Episode Sixteen.mkv
+    2    subs   SubRip/SRT           eng   no   no   English (SDH)
+
+*** Layout 2 (2 files): subs, video, audio
+              Show.S01E18 - Episode Eighteen.mkv
+           <- Show.S01E20 - Episode Twenty.mkv
+    ID   TYPE   CODEC                LANG  DEF  FOR  NAME
+    0    subs   SubRip/SRT           eng   yes  no   (no name)
+    1    video  AVC/H.264/MPEG-4p10  eng   yes  no   -
+    2    audio  AC-3                 eng   yes  no   English (SDH)
+
+*** 1 discrepancy affects a track that config.yaml selects:
+      2 files use a different track layout, at selected tracks 0, 1, 2
+*** 1 informational (does not affect what gets muxed):
+      track 2 (subtitles, config title "Signs") - default differs across 2 groups
+```
+
+How to read it:
+
+- **Structural groups, largest first.** Files with a different track order or a
+  missing track form their own group, listed once — not once per shifted ID.
+- **One row per distinct value, not per file** — a 200-episode batch is as compact
+  as a 3-episode one. Every track is listed, so the table doubles as the map you
+  check `config.yaml`'s IDs against. The `DEF`/`FOR` columns make a flag-only
+  difference legible, and on a terminal the differing cell is highlighted.
+- **The `<-` names only the files that deviate**, one per line; the majority is the
+  unnamed reference.
+- **Blocking vs informational.** A difference only corrupts output when it lands on
+  a track the config selects by ID *and* not every track of that type is being
+  copied. Everything else — unselected tracks, chapters, a type copied wholesale —
+  is reported as informational.
+
+What is compared: per layout, the type at each ID; then per ID, codec, language,
+name and default/forced flags, plus chapter presence and genuinely ambiguous
+same-language duplicates (two tracks that match on type, language, codec *and*
+name, where ID selection cannot tell them apart). What is ignored: the video
+track's title, which carries the episode name and differs by design, along with
+duration, file size and muxing metadata.
+
+By default the check **warns and continues** — muxing the wrong tracks is
+recoverable, the source files survive. Pass `--strict` to abort (exit 2) when any
+discrepancy affects a selected track. File lists are truncated to a few names;
+`--check-verbose` prints them in full (and, like `--check`, muxes nothing).
+Highlighting follows `--color` (`auto` by default: on at a terminal, off when
+redirected).
 
 `--identify` prints the track table you need in order to write the config — id,
 type, codec, language, default/forced flags and track name for every track of
@@ -206,15 +328,51 @@ non-zero if any file failed, so it can be used from a shell script.
 ```
 groovy src/filename_to_title.groovy   # segment title + video track name := file name
 groovy src/propedit.groovy            # batch mkvpropedit — fix properties without remuxing
-groovy src/to_utf8.groovy             # Windows-1251 SRT → UTF-8
+groovy src/to_utf8.groovy             # subtitles → UTF-8, in place
 groovy src/fix_srt.groovy             # repair non-standard SRT timing/markup
 groovy src/find_unused_fonts.groovy   # report unreferenced fonts in fonts/
 ```
 
+#### to_utf8.groovy
+
+```
+groovy src/to_utf8.groovy                          # from windows-1251 (the default)
+groovy src/to_utf8.groovy --encoding windows-1250  # from something else
+groovy src/to_utf8.groovy --backup                 # keep <name>.orig
+groovy src/to_utf8.groovy --dry-run                # report, write nothing
+```
+
+Converts `.srt`, `.ass`, `.ssa` and `.vtt` files in the current directory to
+UTF-8, **in place**. The source encoding defaults to `windows-1251` and is always
+printed, so it is never a silent assumption. The target is always UTF-8 — making
+that configurable would defeat the script's purpose.
+
+Pass `--backup` to keep the original as `<name>.orig`, or `--dry-run` to preview.
+
+Three things make it safe to point at a directory more than once:
+
+- **Files that are already UTF-8 are skipped** — detected by BOM or by decoding
+  cleanly as UTF-8. Pure ASCII lands here too, correctly: it is already valid
+  UTF-8. Double-converting is precisely how a previously fixed file gets ruined.
+- **Decoding is strict.** Java's default decoder *replaces* bytes that are invalid
+  in the source charset, so a wrong `--encoding` would otherwise succeed quietly
+  and produce mojibake. Instead the file is reported and left alone, and the run
+  exits non-zero.
+- **UTF-16 input is detected and skipped** — otherwise it would decode to
+  mojibake that looks valid.
+
+`.sub` is deliberately excluded: the extension is ambiguous between MicroDVD text
+and the binary half of a VobSub `.idx`/`.sub` pair, and rewriting the binary one
+would destroy it.
+
+Line endings are preserved — the file is decoded and re-encoded whole rather than
+line by line, so CRLF subtitles stay CRLF.
+
 ## Configuration
 
-`mux.groovy` is driven by a YAML configuration file (`config.yaml`, located as
-described above); the repo ships a working example at `src/config.yaml`.
+`mux.groovy` is driven by a YAML configuration file (`config.yaml` in the media
+directory, or `--config <path>`); copy the shipped template
+`src/config.example.yaml` as a starting point.
 
 ### General settings
 

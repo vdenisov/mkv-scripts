@@ -21,6 +21,11 @@ import picocli.groovy.PicocliScript2
 
 def extensions = [".mkv", ".mp4", ".avi", ".srt", ".ass", ".mks", ".idx", ".sub", ".mka"] as String[]
 
+// Deliberately no explicit charset: Groovy's no-arg reader runs CharsetToolkit
+// auto-detection, which picks UTF-8 for what fetch_episodes.groovy writes and
+// still falls back to the platform default for an episodes.txt typed or pasted
+// together by hand (Notepad on a Cyrillic Windows saves cp1251). Forcing UTF-8
+// here would mangle exactly that case and gain nothing.
 def episodeNames = new File("episodes.txt")
     .readLines()
     .withIndex()
