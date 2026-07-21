@@ -42,8 +42,9 @@ else is optional tooling around it.
 ```mermaid
 flowchart TD
     TMDB[TheMovieDB API] --> FETCH["fetch_episodes.groovy"]
-    FETCH --> EP["episodes.txt"]
+    FETCH --> EP["episodes.yaml + episodes.txt"]
     EP --> REN["rename.groovy"]
+    EP --> MKV
     REN --> FILES["Show - SxxEyy - Title.ext"]
     FILES --> MKV["mux.groovy"]
     CFG["config.yaml"] --> MKV
@@ -117,38 +118,74 @@ suite is run from the repo root:
 
 ```
 groovy src/fetch_episodes.groovy --show-id 2260 --season 1 [--api-key KEY]
+groovy src/fetch_episodes.groovy --show-id https://www.themoviedb.org/tv/1920-twin-peaks/season/1
+groovy src/fetch_episodes.groovy --show-id 1920 --season 1 --language ru-RU
 ```
+
+`--show-id` takes either the numeric id or the show's URL, so the address can be
+pasted straight from a browser. A URL that names a season supplies `--season`
+too; passing a `--season` that disagrees with the URL is an error rather than a
+silent choice between the two.
 
 If `--api-key` is not supplied, the key is read from `apikey.txt` — the current
 directory first, then the copy next to the script, so the key does not have to be
-copied into every media directory. Episode names are written to `episodes.txt`,
-one per line, with characters invalid in Windows file names stripped, along with
-any trailing dots and spaces (which Windows also rejects). Endpoint examples live
-in `src/themoviedb.http`.
+copied into every media directory. Endpoint examples live in `src/themoviedb.http`.
+
+`--language` takes a TheMovieDB locale such as `ru-RU`, and the names are fetched
+in that language. TheMovieDB answers an untranslated field with an empty string
+rather than falling back on its own, so a partially translated season is topped
+up from `en-US` and the script says when it did that.
+
+Two files are written, both UTF-8, so non-Latin titles survive:
+
+- **`episodes.yaml`** — the full metadata: show name, year, season number and
+  name, and every episode by its real episode number. `mux.groovy` and
+  `rename.groovy` both prefer it.
+- **`episodes.txt`** — one episode name per line, the format that can be written
+  by hand when there is no reason to involve the API at all.
+
+Names are written **exactly as TheMovieDB spells them**, including the `:` and
+`?` that cannot appear in a Windows file name. Stripping those is `rename.groovy`'s
+job, at the moment a name becomes a file name — `mux.groovy` needs the original
+spelling for titles, and a name stripped here could never be recovered.
 
 Failures are reported rather than thrown: a bad key, an unknown show or a
 nonexistent season prints TheMovieDB's own message and exits non-zero.
-`episodes.txt` is written as UTF-8, so non-Latin titles survive.
 
 ### rename.groovy
 
 ```
+groovy src/rename.groovy                          # show name from episodes.yaml
 groovy src/rename.groovy "Show Name" [episodeOffset]
 groovy src/rename.groovy "Show Name" --dry-run    # preview, rename nothing
 ```
 
 Renames every media/subtitle file whose name contains an `sXXeYY` pattern to
-`Show Name - SXXEYY - <episode title>.<ext>`, taking titles from `episodes.txt`.
-A trailing `[suffix]` in the original name (e.g. a dub studio tag) is preserved.
-`episodeOffset` (default 1) maps the first line of `episodes.txt` to an episode
-number.
+`Show Name - SXXEYY - <episode title>.<ext>`. A trailing `[suffix]` in the
+original name (e.g. a dub studio tag) is preserved.
+
+Titles come from `episodes.yaml` when it is present, and from `episodes.txt`
+otherwise. The yaml carries real episode numbers, so a season with a gap in its
+numbering stays aligned. The show name is also taken from `episodes.yaml`, which
+makes the positional argument optional — pass it to override. Names are
+sanitized here, at the point they become file names.
+
+`episodes.txt` has no numbers in it, so it is matched by line order, and
+`episodeOffset` (default 1) is the episode number of its first line. That exists
+for the case it was invented for: a season downloaded in halves, where you fetch
+titles for episodes 11–20 and `11` makes the first line mean E11.
+
+**`episodeOffset` applies to `episodes.txt` only.** With `episodes.yaml` the
+episode numbers are already real, so nothing is shifted and the argument is
+ignored — passing the offset you would have needed for a trimmed `episodes.txt`
+would otherwise put episode 1's title on E11, which looks entirely plausible and
+is wrong.
 
 The whole batch is checked before anything is renamed. If any file has no
-`sXXeYY` pattern, has no matching title in `episodes.txt`, or would overwrite an
-existing file or collide with another rename, every problem is listed and
-nothing is touched. This matters because renaming removes the `sXXeYY` pattern
-that ties a file to its episode, so a rename that failed halfway would have to
-be untangled by hand.
+`sXXeYY` pattern, has no matching title, or would overwrite an existing file or
+collide with another rename, every problem is listed and nothing is touched.
+This matters because renaming removes the `sXXeYY` pattern that ties a file to
+its episode, so a rename that failed halfway would have to be untangled by hand.
 
 `--dry-run` prints the planned `old -> new` pairs and exits.
 
@@ -167,6 +204,11 @@ Reads `config.yaml` (see [Configuration](#configuration) below), discovers all
 files in the current directory matching `allowedExtensions`, and runs `mkvmerge`
 for each one. Output goes to `destinationDir`. If a file fails, the error is
 printed and processing continues with the next file.
+
+Titles in the config can be templates rather than fixed strings — see
+[Substitution variables](#substitution-variables). `--identify` also lists the
+tracks of any companion files the config declares, with the path each pattern
+resolved to for that episode and a `(not found)` line where one is missing.
 
 #### Selecting a subset of the files
 
@@ -369,6 +411,82 @@ the output track order is derived from the config unless you set `trackOrder`
 explicitly. Every field — including `additionalSources` for merging external
 dubs and subtitles with per-episode `${fileName}` resolution — is covered in
 the [configuration reference](docs/reference.md#configuration).
+
+## Substitution variables
+
+Titles and companion paths in `config.yaml` are templates. Instead of writing
+one static string per season, write what the value is made of:
+
+```yaml
+general:
+  title: "${showName} - S${seasonNum}E${episodeNum} - ${episodeName}"
+
+mainSource:
+  videoTrack:
+    title: "Original Japanese"        # the video track's own name
+  audioTracks:
+    - id: 1
+      language: "ru"
+      title: "${languageNative} ${codec}"      # "Русский DTS"
+  subtitleTracks:
+    - id: 4
+      language: "en"
+      title: "${languageName} ${codec}"        # "English SRT"
+```
+
+**File-scope variables** describe the episode and are valid in every templated
+field:
+
+| Variable | Example | Comes from |
+|---|---|---|
+| `fileName` | `Show - S01E02 - Title` | the file being muxed |
+| `extension` | `mkv` | the file being muxed |
+| `showName` | `Twin Peaks` | `episodes.yaml`, else the canonical file name |
+| `seasonNum` | `01` | the `SxxEyy` in the file name, else `episodes.yaml` |
+| `episodeNum` | `02` | the `SxxEyy` in the file name |
+| `episodeName` | `Traces to Nowhere` | `episodes.yaml` / `episodes.txt`, else the canonical file name |
+| `seasonName` | `Season 1` | `episodes.yaml` |
+| `showYear` | `1990` | `episodes.yaml` |
+
+**Track-scope variables** describe one track and are valid only in a track's
+`title`:
+
+| Variable | Example | Comes from |
+|---|---|---|
+| `language` | `ru` | that track's `language` in the config |
+| `languageName` | `Russian` | the JDK's language data |
+| `languageNative` | `Русский` | the JDK's language data, capitalized |
+| `codec` | `DTS`, `SRT`, `H.264` | the actual track, via `mkvmerge -J` |
+
+Because `episodeName` comes from `episodes.yaml` rather than from the file name,
+it keeps the characters a file name cannot hold — an episode really called
+`Zen, or the Skill to Catch a Killer: Part 2?` is spelled that way in the title
+even though the file on disk is not.
+
+The segment (container) title and the video track name are separate fields.
+`general.title` sets the first, `mainSource.videoTrack.title` the second; each
+defaults to the file name independently. Players disagree about which of the two
+they display, and some label one with the other's name — so if you are unsure
+what yours reads, setting both to the same value is the safe option.
+
+**A misspelled variable is an error, not a literal.** Every template is checked
+before anything is probed or muxed, in every mode, and an unknown name — or a
+track variable used in a file-scope field — exits 2 naming the offending field:
+
+```
+*** Error: config.yaml has 1 substitution problem:
+  mainSource.audioTracks[0].title: ${languagName}
+      valid here: codec, episodeName, episodeNum, extension, fileName, ...
+```
+
+A variable that is valid but has *no data for one particular episode* is a
+different matter: those episodes are reported and dropped, and the rest of the
+batch is muxed, the same way a missing companion file is handled. `--strict`
+turns that into an abort as well.
+
+There is no escape syntax, so a literal `${...}` cannot currently be written in
+a title. `--check` prints templates unresolved, on purpose: its report runs
+across the whole batch and identifies *which config entry* a finding refers to.
 
 ## Tests
 

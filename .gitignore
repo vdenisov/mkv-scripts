@@ -8,7 +8,11 @@ out/
 apikey.txt
 episodes.txt
 episodes.txt.bak
+episodes.yaml
 http-client.private.env.json
+
+# Scratch planning notes, deliberately untracked
+ROADMAP.md
 
 # Test artifacts
 work/

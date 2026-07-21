@@ -207,6 +207,285 @@ def probeFile = { File file ->
     [file: file, ok: true, raw: parsed, tracks: tracks, chapters: chapterCount]
 }
 
+// Probe results, keyed by file. Declared here rather than next to the probing
+// loop far below because the closures in this section capture it by enclosing
+// scope at definition time — the same rule that makes every helper here a
+// closure in the first place.
+def probedInfos = [:]
+
+// ── Substitution variables ──────────────────────────────────────────────────
+//
+// Config values are templates: "${languageName} ${codec}" rather than a literal
+// "Russian SRT". Variables come in two scopes — file-scope ones describe the
+// episode being muxed and are valid everywhere, track-scope ones describe the
+// track a title belongs to and are only valid in a title. Unknown names are a
+// config error caught up front (see the validation block below), never a
+// literal passed through to mkvmerge.
+def episodesHelper = evaluate(new File(scriptDir, 'episodes.groovy'))
+
+def FILE_VARS = ['fileName', 'extension', 'showName', 'seasonNum',
+                 'episodeNum', 'episodeName', 'seasonName', 'showYear'] as Set
+def TRACK_VARS = ['language', 'languageName', 'languageNative', 'codec'] as Set
+
+// Episode metadata, read from the media directory only — mux never goes to the
+// network. episodes.yaml carries real episode numbers and the raw spelling of
+// each name, which is the whole point: the ':' and '?' that cannot appear in a
+// file name survive here and can go into a title.
+def episodeData = null
+def episodeSource = null
+def episodesYaml = new File('episodes.yaml')
+def episodesText = new File('episodes.txt')
+if (episodesYaml.isFile()) {
+    episodeData = episodesHelper.normalizeYaml(new Yaml().load(episodesYaml.getText('UTF-8')) as Map)
+    episodeSource = 'episodes.yaml'
+} else if (episodesText.isFile()) {
+    // Line N is episode N. There is no offset option here — mux is not the
+    // script that decides numbering — so a trimmed episodes.txt, holding only
+    // the episodes on hand from partway through a season, misses. The pre-flight
+    // reports those files as dropped rather than stamping a plausible wrong
+    // title into them; episodes.yaml is the answer for any season not from 1.
+    episodeData = [byEpisode: episodesHelper.indexFromLines(episodesText.readLines(), 1)]
+    episodeSource = 'episodes.txt'
+}
+
+// Language display names come from the JDK's CLDR data, so no table of our own
+// has to be maintained. Both the two-letter codes config.yaml uses and the
+// three-letter codes Matroska carries resolve to the same locale.
+def localeByCode = [:]
+Locale.getISOLanguages().each { code ->
+    def loc = new Locale(code)
+    localeByCode[code] = loc
+    try {
+        localeByCode[loc.getISO3Language()] = loc
+    } catch (ignored) {
+        // A handful of codes have no three-letter form; the two-letter one stands.
+    }
+}
+// ISO 639-2/B ("bibliographic") codes, which differ from the /T codes the JDK
+// returns. Matroska files in the wild carry these, so they have to resolve too.
+[ger: 'de', fre: 'fr', dut: 'nl', chi: 'zh', cze: 'cs', gre: 'el', per: 'fa',
+ rum: 'ro', slo: 'sk', alb: 'sq', arm: 'hy', baq: 'eu', bur: 'my', geo: 'ka',
+ ice: 'is', mac: 'mk', mao: 'mi', may: 'ms', tib: 'bo', wel: 'cy'].each { bib, code ->
+    localeByCode[bib] = new Locale(code)
+}
+
+def localeFor = { String code -> code ? localeByCode[code.toLowerCase()] : null }
+
+def languageNameOf = { String code ->
+    def loc = localeFor(code)
+    if (loc == null) return null
+    def name = loc.getDisplayLanguage(Locale.ENGLISH)
+    // The JDK echoes the code back when it has no display name for it
+    (!name || name.equalsIgnoreCase(code)) ? null : name
+}
+
+def languageNativeOf = { String code ->
+    def loc = localeFor(code)
+    if (loc == null) return null
+    def name = loc.getDisplayLanguage(loc)
+    if (!name || name.equalsIgnoreCase(code)) return null
+    // Many languages spell their own name in lower case ("русский"), which
+    // reads wrong in a track title. Upper-case in that language's own rules.
+    name.substring(0, 1).toUpperCase(loc) + name.substring(1)
+}
+
+// Keyed on codec_id, a Matroska specification identifier, rather than on
+// mkvmerge's `codec` display string: the display string is not stable across
+// mkvmerge versions (v99 reports "AVC/H.264/MPEG-4p10" where older releases
+// report the components in the opposite order), and CI runs both a distro
+// mkvtoolnix and the newest release.
+def CODEC_BY_ID = [
+    'V_MPEG4/ISO/AVC' : 'H.264', 'V_MPEGH/ISO/HEVC': 'H.265', 'V_AV1' : 'AV1',
+    'V_MPEG2'         : 'MPEG-2', 'V_VP9'          : 'VP9',
+    'A_AAC'           : 'AAC',   'A_AC3'           : 'AC-3',  'A_EAC3': 'E-AC-3',
+    'A_DTS'           : 'DTS',   'A_TRUEHD'        : 'TrueHD', 'A_FLAC': 'FLAC',
+    'A_OPUS'          : 'Opus',  'A_MPEG/L3'       : 'MP3',   'A_VORBIS': 'Vorbis',
+    'A_PCM/INT/LIT'   : 'PCM',
+    'S_TEXT/UTF8'     : 'SRT',   'S_TEXT/ASS'      : 'ASS',   'S_TEXT/SSA': 'SSA',
+    'S_TEXT/WEBVTT'   : 'WebVTT', 'S_HDMV/PGS'     : 'PGS',   'S_VOBSUB': 'VobSub',
+]
+// Raw (non-Matroska) companion files carry no codec_id at all — a bare .ass
+// probes with an empty codec_id and only a display string — so that is the
+// second tier. Anything unmapped falls through to mkvmerge's own name, which
+// is already readable.
+def CODEC_BY_DISPLAY = [
+    'SubStationAlpha': 'ASS', 'SubRip/SRT': 'SRT', 'HDMV PGS': 'PGS', 'VobSub': 'VobSub',
+]
+
+def friendlyCodec = { track ->
+    if (track == null) return null
+    def codecId = track.get('properties')?.get('codec_id')
+    def mapped = codecId ? CODEC_BY_ID[codecId.toString()] : null
+    if (mapped) return mapped
+    def display = track.codec?.toString()
+    display ? (CODEC_BY_DISPLAY[display] ?: display) : null
+}
+
+// File-scope variables for one episode, memoized. Sources are tried in order:
+// episodes.yaml (or episodes.txt), then the canonical "Show - SxxEyy - Title"
+// file name. Anything still unresolved is reported per file by the pre-flight
+// below, so a season with one episode missing from the metadata loses that one
+// episode rather than the whole batch.
+def fileVarCache = [:]
+def fileVarsFor = { File file ->
+    def cached = fileVarCache[file]
+    if (cached != null) return cached
+
+    def base = FilenameUtils.getBaseName(file.name)
+    def parsed = episodesHelper.parseSeasonEpisode(base)
+    def canonical = episodesHelper.parseCanonicalName(base)
+
+    // Episode numbers are only meaningful within one season, so metadata for a
+    // different season must not be joined against this file.
+    def seasonMatches = !(episodeData?.season != null && parsed?.season != null &&
+                          episodeData.season != parsed.season)
+    def usable = episodeData != null && seasonMatches
+    def fromData = (usable && parsed?.episode) ? episodeData.byEpisode[parsed.episode] : null
+
+    def vars = [
+        fileName   : base,
+        extension  : FilenameUtils.getExtension(file.name),
+        seasonNum  : parsed?.season ?: (usable ? episodeData.season : null),
+        episodeNum : parsed?.episode,
+        episodeName: fromData ?: canonical?.title,
+        showName   : (usable ? episodeData.show : null) ?: canonical?.showName,
+        seasonName : usable ? episodeData.seasonName : null,
+        showYear   : usable ? episodeData.year : null,
+    ]
+
+    def result = [vars: vars, missing: vars.findAll { k, v -> !v }.keySet()]
+    fileVarCache[file] = result
+    result
+}
+
+// The probed track behind a config track entry, for ${codec}. Probing is only
+// ever triggered when a template actually uses ${codec}; the record is normally
+// already there from the pre-flight check.
+def probedTrackFor = { File file, Integer trackId ->
+    def info = probedInfos[file]
+    if (info == null) {
+        info = probeFile(file)
+        probedInfos[file] = info
+    }
+    if (!info.ok) return null
+    info.raw.tracks.find { (it.id as Integer) == trackId }
+}
+
+def companionProbeCache = [:]
+def companionTrackFor = { String path ->
+    if (!companionProbeCache.containsKey(path)) {
+        def f = new File(path)
+        companionProbeCache[path] = f.isFile() ? probeFile(f) : null
+    }
+    def info = companionProbeCache[path]
+    (info?.ok) ? info.raw.tracks.find { (it.id as Integer) == 0 } : null
+}
+
+def trackVarsFor = { track, probed ->
+    def code = track?.language?.toString()
+    [language      : code,
+     languageName  : languageNameOf(code),
+     languageNative: languageNativeOf(code),
+     codec         : friendlyCodec(probed)]
+}
+
+def VAR_PATTERN = /\$\{([A-Za-z][A-Za-z0-9]*)\}/
+// Deliberately looser than VAR_PATTERN, so that a malformed body — ${file name},
+// ${var:modifier} — is caught by validation instead of silently surviving as a
+// literal because it failed to look like a variable.
+def LOOSE_PATTERN = /\$\{[^}]*\}/
+
+def substitute = { String template, Map vars ->
+    template.replaceAll(VAR_PATTERN) { full, name -> vars[name] ?: '' }
+}
+
+// Every templated config value, with the variable scope legal in it. Built once
+// so that validation, the pre-flight and the command line all agree on exactly
+// which fields are templates.
+def templateFields = []
+if (config != null) {
+    def all = FILE_VARS + TRACK_VARS
+    if (config.general?.containsKey('title')) {
+        templateFields << [path: 'general.title', value: config.general.title, allowed: FILE_VARS]
+    }
+    def videoTrack = config.mainSource?.videoTrack
+    if (videoTrack?.containsKey('title')) {
+        templateFields << [path: 'mainSource.videoTrack.title', value: videoTrack.title,
+                           allowed: all, track: videoTrack]
+    }
+    ['audioTracks', 'subtitleTracks'].each { key ->
+        (config.mainSource?.get(key) ?: []).eachWithIndex { track, i ->
+            if (track?.containsKey('title')) {
+                templateFields << [path: "mainSource.${key}[${i}].title", value: track.title,
+                                   allowed: all, track: track]
+            }
+        }
+    }
+    (config.additionalSources ?: []).eachWithIndex { source, i ->
+        if (source?.file) {
+            templateFields << [path: "additionalSources[${i}].file", value: source.file, allowed: FILE_VARS]
+        }
+        (source?.tracks ?: []).eachWithIndex { track, j ->
+            if (track?.containsKey('title')) {
+                templateFields << [path: "additionalSources[${i}].tracks[${j}].title", value: track.title,
+                                   allowed: all, track: track]
+            }
+        }
+    }
+}
+
+// Which variables the config actually uses. Everything derived below is gated
+// on these, so a config with no templates costs nothing at all.
+def usedFileVars = [] as Set
+def usesCodec = false
+
+// Validation, stage one: a name that is not a variable, or not a variable legal
+// in this field, is a config error — fatal, before anything is probed or muxed,
+// in every mode. A typo'd ${epsiodeName} would otherwise be stamped verbatim
+// into the track names of an entire season.
+if (config != null) {
+    def offenses = []
+    def badLanguages = []
+
+    templateFields.each { field ->
+        def text = field.value?.toString() ?: ''
+        def usesLanguageName = false
+
+        (text =~ LOOSE_PATTERN).each { occurrence ->
+            def matcher = occurrence =~ /^\$\{([A-Za-z][A-Za-z0-9]*)\}$/
+            def name = matcher ? matcher.group(1) : null
+            if (name == null || !field.allowed.contains(name)) {
+                offenses << [path: field.path, token: occurrence, allowed: field.allowed]
+                return
+            }
+            if (FILE_VARS.contains(name)) usedFileVars << name
+            if (name == 'codec') usesCodec = true
+            if (name == 'languageName' || name == 'languageNative') usesLanguageName = true
+        }
+
+        // A language code that has no display name is equally config-static, so
+        // it belongs in the same fail-fast pass rather than surfacing per file.
+        if (usesLanguageName) {
+            def code = field.track?.language?.toString()
+            if (languageNameOf(code) == null || languageNativeOf(code) == null) {
+                badLanguages << [path: field.path, code: code]
+            }
+        }
+    }
+
+    if (offenses || badLanguages) {
+        ui.error("config.yaml has ${ui.plural(offenses.size() + badLanguages.size(), 'substitution problem')}:")
+        offenses.each {
+            System.err.println "  ${it.path}: ${it.token}"
+            System.err.println "      valid here: ${it.allowed.sort().join(', ')}"
+        }
+        badLanguages.each {
+            System.err.println "  ${it.path}: no language name for '${it.code ?: '(none)'}'"
+        }
+        System.exit(2)
+    }
+}
+
 // Print a readable track table for one file, for --identify.
 def identifyFile = { File file, Map info ->
     ui.header("*** ${file.name}")
@@ -237,6 +516,40 @@ def identifyFile = { File file, Map info ->
                props.get('default_track') ? 'yes' : 'no',
                props.get('forced_track') ? 'yes' : 'no',
                props.get('track_name') ?: '')
+    }
+
+    // Companion sources declared in the config, resolved for this episode. The
+    // resolved path is printed as well as its tracks: with templated paths, what
+    // a pattern actually expands to per episode is half of what one wants to see
+    // here. Never fatal — --identify describes what is there, so a companion
+    // that is missing is a line in the report, not an error.
+    (config?.additionalSources ?: []).each { source ->
+        def path = substitute(source.file.toString(), fileVarsFor(file).vars)
+        def companion = new File(path)
+        println()
+        println ui.cyan("  + ${path}")
+        if (!companion.isFile()) {
+            println "    (not found)"
+            return
+        }
+        def probed = probeFile(companion)
+        if (!probed.ok) {
+            println "    (mkvmerge could not identify this file: ${probed.reason})"
+            return
+        }
+        (probed.raw.tracks ?: []).each { track ->
+            def props = track.get('properties') ?: [:]
+            printf("    %-4s %-10s %-22s %-5s %-4s %-4s %s%n",
+                   track.id,
+                   track.type ?: '?',
+                   track.codec ?: '?',
+                   // A raw .ass or .srt has no language and no codec_id at all,
+                   // so this cell is routinely empty for companions.
+                   props.get('language') ?: '-',
+                   props.get('default_track') ? 'yes' : 'no',
+                   props.get('forced_track') ? 'yes' : 'no',
+                   props.get('track_name') ?: '')
+        }
     }
     println()
 }
@@ -643,7 +956,15 @@ def fileName = null
 def extension = null
 
 // Build command line based on configuration; closure so it captures script-scope locals
-def buildCommandLine = {
+def buildCommandLine = { File currentFile ->
+    // Substitution resolves eagerly here: this closure is re-invoked per file,
+    // after fileName is set, so there is no need for the lazy-GString treatment
+    // the file name itself gets.
+    def fileVars = fileVarsFor(currentFile).vars
+    def subst = { value, Map extra = [:] ->
+        substitute(value.toString(), extra ? fileVars + extra : fileVars)
+    }
+
     def commandLine = [mkvmergeExe] as ArrayList
     if (uiLanguage != null) {
         commandLine.addAll(["--ui-language", uiLanguage])
@@ -683,11 +1004,16 @@ def buildCommandLine = {
     }
 
     // Add video track settings (always first track)
-    def videoTrackLang = config.mainSource.videoTrack.language
-    // Allow overriding video track name but use filename as default
-    def videoTrackTitle = config.mainSource.videoTrack.containsKey('title') ? 
-                          config.mainSource.videoTrack.title : 
-                          "${-> fileName}"
+    def videoTrack = config.mainSource.videoTrack
+    def videoTrackLang = videoTrack.language
+    // Allow overriding video track name but use filename as default. This is
+    // the video *track* name, distinct from the segment title set below — many
+    // players conflate the two, but they are separate fields and are worth
+    // setting separately ("Original Japanese" against the episode title).
+    def videoTrackTitle = videoTrack.containsKey('title')
+        ? subst(videoTrack.title, usesCodec ? trackVarsFor(videoTrack, probedTrackFor(currentFile, 0))
+                                            : trackVarsFor(videoTrack, null))
+        : "${-> fileName}"
 
     commandLine.addAll([
         "--language",
@@ -699,11 +1025,12 @@ def buildCommandLine = {
     // Add audio tracks
     if (hasAudioTracks) {
         config.mainSource.audioTracks.each { track ->
+            def probed = usesCodec ? probedTrackFor(currentFile, track.id as Integer) : null
             commandLine.addAll([
                 "--language",
                 "${track.id}:${track.language}",
                 "--track-name",
-                "${track.id}:${track.title}"
+                "${track.id}:${subst(track.title, trackVarsFor(track, probed))}"
             ])
 
             commandLine.addAll([
@@ -716,11 +1043,12 @@ def buildCommandLine = {
     // Add subtitle tracks
     if (hasSubtitleTracks) {
         config.mainSource.subtitleTracks.each { track ->
+            def probed = usesCodec ? probedTrackFor(currentFile, track.id as Integer) : null
             commandLine.addAll([
                 "--language",
                 "${track.id}:${track.language}",
                 "--track-name",
-                "${track.id}:${track.title}"
+                "${track.id}:${subst(track.title, trackVarsFor(track, probed))}"
             ])
 
             if (track.containsKey('charset')) {
@@ -747,16 +1075,19 @@ def buildCommandLine = {
     // Add additional sources if configured
     if (config.containsKey('additionalSources')) {
         config.additionalSources.each { source ->
+            def sourcePath = subst(source.file)
+
             // Add track settings for this source
             source.tracks.each { track ->
                 // Assume track ID 0 for additional tracks
                 def trackId = 0
+                def probed = usesCodec ? companionTrackFor(sourcePath) : null
 
                 commandLine.addAll([
                     "--language",
                     "${trackId}:${track.language}",
                     "--track-name",
-                    "${trackId}:${track.title}"
+                    "${trackId}:${subst(track.title, trackVarsFor(track, probed))}"
                 ])
 
                 // Add charset for subtitle tracks if specified
@@ -783,16 +1114,18 @@ def buildCommandLine = {
             // Add source file
             commandLine.addAll([
                 "(",
-                source.file.replace('${fileName}', fileName),
+                sourcePath,
                 ")"
             ])
         }
     }
 
-    // Add title and track order
+    // Add title and track order. The segment title defaults to the file name,
+    // as it always has; general.title overrides it independently of the video
+    // track name above.
     commandLine.addAll([
         "--title",
-        "${-> fileName}", // Use filename as title
+        config?.general?.containsKey('title') ? subst(config.general.title) : "${-> fileName}",
         "--track-order",
         effectiveTrackOrder
     ])
@@ -848,6 +1181,50 @@ if ((fileMasks || excludeMasks) && !files) {
 // mkvmerge failure partway through a long batch. Check them all up front and
 // drop just the affected episodes: those would have failed anyway, and the rest
 // of the batch is still worth muxing.
+// Validation, stage two: a variable that is perfectly valid but has no data for
+// one particular episode — a season where TheMovieDB is missing episode 25, a
+// stray file with no episode number in its name. That is data-shaped and
+// per-file, so it drops the affected episodes and muxes the rest, exactly like
+// the companion check below; a typo, which would affect every file, was already
+// fatal above. --strict turns it into an abort, as it does for the check.
+if (usedFileVars && !identifyOnly) {
+    def unresolvedByVar = new LinkedHashMap()
+    def blocked = [] as Set
+
+    files.findAll { allowedExtensions.contains(FilenameUtils.getExtension(it.name.toLowerCase())) }
+         .each { file ->
+             def missing = fileVarsFor(file).missing.intersect(usedFileVars)
+             missing.each { unresolvedByVar.get(it, []) << file.name }
+             if (missing) blocked << file.name
+         }
+
+    if (blocked) {
+        if (strict) {
+            System.err.println ui.red("*** Strict mode: aborting (${blocked.size()} file(s) with unresolved " +
+                                      "substitution variables).")
+            System.exit(2)
+        }
+        println ui.yellow("*** ${blocked.size()} file(s) will be skipped: substitution variables have no value")
+        if (episodeSource == null) {
+            println "      no episodes.yaml or episodes.txt in this directory"
+        }
+        unresolvedByVar.each { name, names ->
+            println "      \${${name}}  (unresolved for ${names.size()} file(s))"
+            formatFileList(names, '        ').each { println it }
+        }
+        println()
+
+        files = files.findAll { !blocked.contains(it.name) }
+
+        if (!files.any { allowedExtensions.contains(FilenameUtils.getExtension(it.name.toLowerCase())) }) {
+            println ui.yellow("*** Nothing left to mux")
+            println()
+            ui.success("*** Done")
+            return
+        }
+    }
+}
+
 def companionSources = config?.additionalSources ?: []
 if (companionSources && !identifyOnly) {
     def missingBySource = new LinkedHashMap()
@@ -855,9 +1232,9 @@ if (companionSources && !identifyOnly) {
 
     files.findAll { allowedExtensions.contains(FilenameUtils.getExtension(it.name.toLowerCase())) }
          .each { file ->
-             def base = FilenameUtils.getBaseName(file.name)
+             def fileVars = fileVarsFor(file).vars
              companionSources.each { source ->
-                 if (!new File(source.file.replace('${fileName}', base)).isFile()) {
+                 if (!new File(substitute(source.file.toString(), fileVars)).isFile()) {
                      missingBySource.get(source.file, []) << file.name
                      blocked << file.name
                  }
@@ -910,20 +1287,19 @@ if (!mediaFiles) {
 }
 
 def wantCheck = checkOnly || (!identifyOnly && !noCheck)
-def infos = [:]
 if (mediaFiles && (identifyOnly || wantCheck)) {
     // Probing runs `mkvmerge -J` per file, which is seconds of silence on a
     // slow share for a full season. Print a live tick so it never looks hung.
     print "*** Reading ${mediaFiles.size()} file(s)"
     System.out.flush()
-    mediaFiles.each { infos[it] = probeFile(it); print '.'; System.out.flush() }
+    mediaFiles.each { probedInfos[it] = probeFile(it); print '.'; System.out.flush() }
     println()
     println()
 }
 
 def blockingCount = 0
 if (mediaFiles && wantCheck) {
-    blockingCount = runConsistencyCheck(mediaFiles, infos)
+    blockingCount = runConsistencyCheck(mediaFiles, probedInfos)
 }
 
 if (blockingCount > 0 && strict) {
@@ -963,7 +1339,7 @@ files.forEach { file ->
 
         if (allowedExtensions.contains extension) {
             if (identifyOnly) {
-                identifyFile(file, infos[file])
+                identifyFile(file, probedInfos[file])
                 return
             }
 
@@ -973,7 +1349,7 @@ files.forEach { file ->
             fileName = FilenameUtils.getBaseName(file.name)
 
             // Build command line based on configuration
-            def commandLine = buildCommandLine()
+            def commandLine = buildCommandLine(file)
 
             if (dryRun) {
                 // Force the lazy GStrings now that fileName/extension are set

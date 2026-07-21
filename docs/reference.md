@@ -134,6 +134,9 @@ general:
   # mkvmergeExe is optional: omit it to auto-detect mkvmerge from PATH,
   # or set it to a full path to override.
   mkvmergeExe: "C:\\Program Files\\MKVToolNix\\mkvmerge.exe"
+  # title is optional: the segment (container) title, defaulting to the file
+  # name. Separate from the video track name in mainSource below.
+  title: "${showName} - S${seasonNum}E${episodeNum} - ${episodeName}"
 ```
 
 ### Main source settings
@@ -146,7 +149,7 @@ mainSource:
   videoTrack:
     language: "en"                                    # Video track language
     # title will be set to filename by default
-    # title: "Custom Video Title"                     # Optional: override video track name
+    # title: "Original Japanese"                      # Optional: override video track name
 
   audioTracks:
     - id: 2                                           # Track ID from mkvmerge -i
@@ -155,7 +158,7 @@ mainSource:
       default: true                                   # Is default track (omit = false)
     - id: 1
       language: "ru"
-      title: "Russian"
+      title: "${languageNative} ${codec}"             # -> "Русский DTS"
       default: false
 
   subtitleTracks:
@@ -174,6 +177,28 @@ mainSource:
 - Omitting `subtitleTracks` entirely (or setting it to `[]`) copies no subtitle tracks.
 - `charset` is optional; omit it to let mkvmerge use the subtitle file's detected encoding.
 - `default` defaults to `false`/`no` when omitted.
+- `general.title` and `videoTrack.title` are separate fields: the first is the
+  segment (container) title, the second the video track's own name. Each falls
+  back to the file name on its own.
+
+### Substitution variables
+
+Every `title`, and every `additionalSources` file path, is a template. See
+[Substitution variables](../README.md#substitution-variables) in the README for
+the full tables; in short:
+
+- **File scope**, valid in any of those fields: `fileName`, `extension`,
+  `showName`, `seasonNum`, `episodeNum`, `episodeName`, `seasonName`, `showYear`.
+  Values come from `episodes.yaml` (or `episodes.txt`) in the media directory,
+  falling back to a canonical `Show - SxxEyy - Title` file name.
+- **Track scope**, valid only in a track's `title`: `language`, `languageName`
+  (`Russian`), `languageNative` (`Русский`), `codec` (`DTS`, `SRT`, `H.264`).
+
+An unknown name, or a track variable used outside a track title, is reported and
+exits 2 before anything is probed or muxed. A known variable with no data for a
+given episode drops that episode from the batch and muxes the rest; `--strict`
+turns that into an abort. There is no escape syntax, so a literal `${...}`
+cannot currently be written into a title.
 
 ### Track order
 
@@ -206,9 +231,14 @@ visible effect at all.
 Include tracks from extra files (audio dubs, external subtitles). Each
 additional source must contain exactly one track. Track ID is always 0.
 
-`${fileName}` in the `file` field is replaced at runtime with the base name (no
-extension) of the current main source file, enabling per-episode companion
-files.
+The `file` field takes the file-scope substitution variables above, resolved per
+episode. `${fileName}` — the base name, no extension, of the current main source
+— is the usual one, but a companion kept in a per-studio folder works the same
+way: `"Rus sound/[Studio]/${fileName}.mka"`. A track's `title` here also takes
+the track-scope variables, describing the companion's own language and codec.
+
+`mkv-mux --identify` lists each configured companion with the path its pattern
+resolved to for that episode, which is the quickest way to check one.
 
 ```yaml
 additionalSources:

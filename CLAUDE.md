@@ -20,7 +20,9 @@ groovy src/mux.groovy --dry-run                             # Print the mkvmerge
 groovy src/mux.groovy "Show.S01E0[12].mkv"                  # Operate on a subset: file names or globs, repeatable
 groovy src/mux.groovy --exclude "*.sample.mkv"              # Skip files matching a pattern, repeatable
 groovy src/fetch_episodes.groovy --show-id 2260 --season 1  # Fetch episode names from TheMovieDB
-groovy src/rename.groovy "Show Name" [episodeOffset]        # Batch-rename files (--dry-run to preview)
+groovy src/fetch_episodes.groovy --show-id <TMDB URL>       # Id (and season) parsed out of the URL
+groovy src/fetch_episodes.groovy --show-id 1920 --season 1 --language ru-RU
+groovy src/rename.groovy ["Show Name"] [episodeOffset]      # Batch-rename files (--dry-run to preview)
 groovy src/filename_to_title.groovy                         # Set MKV segment title/track name from filename
 groovy src/fix_srt.groovy                                   # Validate and reformat SRT files
 groovy src/to_utf8.groovy [--encoding CS] [--backup]        # Subtitles → UTF-8 in place (srt/ass/ssa/vtt)
@@ -41,7 +43,7 @@ Each script also has a wrapper in `bin/` (`mkv-mux`, `mkv-fetch-episodes`, `mkv-
 ## Running tests
 
 ```bash
-groovy src/test/run_tests.groovy              # Run all 90 tests
+groovy src/test/run_tests.groovy              # Run all 108 tests
 groovy src/test/run_tests.groovy --filter 01  # Run a single test by name fragment
 groovy src/test/run_tests.groovy --keep       # Preserve src/test/work/ for inspection after run
 ```
@@ -57,6 +59,23 @@ Harness conventions worth knowing before adding a case:
 - `withStubServer(routes, body)` stands up a JDK `com.sun.net.httpserver.HttpServer` on a random port and serves canned JSON per path. This is how `fetch_episodes.groovy` is tested offline: the script's hidden `--base-url` option points it at the stub. Deterministic and dependency-free, so it runs everywhere including CI.
 - The live TheMovieDB contract test (`37_…`) is skip-guarded on a key in `TMDB_API_KEY` or `src/apikey.txt`, following the same pattern as `mkvpropeditExe`. It runs automatically on the dev machine and skips elsewhere — including on PRs from forks, where GitHub withholds secrets by design.
 - When a test fails, the harness prints the captured output of the script under test; this is what makes subprocess failures diagnosable in CI logs.
+- **Never run two suites at once**, including a `--filter` run alongside a full one. Work directories are `src/test/work/<case>`, keyed by case name only, and `runTest` deletes and recreates that directory as it starts — so a second run wipes the first run's fixture mid-test. The failure surfaces somewhere unrelated to whatever is actually being worked on (a `--filter 38` run against a full run in the background made `38_non_ascii_titles_round_trip` fail with "No episode data", which looks exactly like a rename regression and is not one).
+
+## Episode metadata: `episodes.yaml` and `episodes.txt`
+
+`fetch_episodes.groovy` writes **both**, always, and **neither is sanitized** — names carry the exact TheMovieDB spelling, `:` and `?` included. Stripping happens in `rename.groovy`, at the point a name becomes a file name, because `mux.groovy` needs the original spelling for `${episodeName}` and a name stripped at fetch time could never be recovered.
+
+Migration note worth keeping: `rename.groovy` from v1.3.0 or earlier, fed a `episodes.txt` written by a current `fetch_episodes.groovy`, will put characters into file names that Windows rejects. Only that direction is affected — sanitizing is idempotent, so a current `rename.groovy` handles an older, already-stripped `episodes.txt` correctly.
+
+`episodes.yaml` carries show name, year, season number and name, the fetch locale, and every episode by its **real** `episode_number` (so a gap in a season does not shift everything after it). `episodes.txt` stays the format that can be written by hand — one name per line, matched by line order plus `episodeOffset`. Both `rename.groovy` and `mux.groovy` prefer the yaml and fall back to the txt.
+
+**`episodeOffset` applies to `episodes.txt` alone.** The offset is not a preference: that file has no numbers in it, so the offset is part of *how it is read* — it is the episode number of the first line, which is what makes a partial file (titles for E11–E20) usable. `episodes.yaml` carries real numbers, so there is nothing to shift, and it is ignored there. Test `94b` pins both halves.
+
+Anyone wanting genuine renumbering — anime absolute numbering against a season-split show — needs an explicitly named option for it rather than a second meaning on this one, and it belongs with the `--episode-regex` work parked in `ROADMAP.md`.
+
+`mux.groovy` reads `episodes.txt` as line N = episode N and takes no offset — it is not the script that decides numbering. A trimmed `episodes.txt` therefore misses, and the stage-two pre-flight reports those files as dropped rather than stamping a wrong title into them; `episodes.yaml` is the answer for any season not starting at 1. The alternative — sort the files and match **positionally**, file *i* ↔ line *i*, needing no numbers at all — fails the other way round, silently mis-titling when `episodes.txt` holds a full season but only some of the files are present. The number-based join was chosen because missing loudly beats mis-titling quietly.
+
+Charset contract: the yaml is read and written with an **explicit UTF-8** both ways (machine-written, so it is a fixed contract), while `episodes.txt` keeps its asymmetry, below. `episodes.yaml` is dumped with `allowUnicode = true`, without which snakeyaml escapes every Cyrillic character as `\uXXXX` — valid YAML, unreadable for exactly the titles the feature exists to preserve.
 
 **Groovy's File I/O is charset-asymmetric**, which drives the `episodes.txt` contract: the no-arg *reader* (`readLines()`, `getText()`) runs `CharsetToolkit` auto-detection and picks UTF-8 for UTF-8 content, but the no-arg *writer* (`withWriter {}`) uses the platform default and silently writes `?` for every unmappable character. So `fetch_episodes.groovy` writes with an explicit `'UTF-8'` (lossy otherwise on a non-UTF-8 default), while `rename.groovy` reads with no charset on purpose — forcing UTF-8 there would break a hand-assembled `episodes.txt` and gain nothing over auto-detection. Verified by probe under `-Dfile.encoding=ISO-8859-1`; note that reproducing this needs `-Dgroovy.source.encoding=UTF-8` too, or Groovy compiles the script's own string literals with the hostile charset and every result is self-consistently wrong.
 
@@ -72,9 +91,10 @@ Scripts form a sequential pipeline:
 
 ```
 TheMovieDB API
-  └─ fetch_episodes.groovy → src/episodes.txt
+  └─ fetch_episodes.groovy → episodes.yaml + episodes.txt
        └─ rename.groovy   → renamed files (Show - SxxEyy - Title.ext)
-            └─ mux.groovy (+ config.yaml) → mkvmerge → output MKV in destinationDir/
+            └─ mux.groovy (+ config.yaml, + episodes.yaml for ${...} titles)
+                 → mkvmerge → output MKV in destinationDir/
                  └─ post-processing utilities:
                       filename_to_title.groovy  (embed metadata)
                       propedit.groovy               (fix track flags)
@@ -83,17 +103,43 @@ TheMovieDB API
                       find_unused_fonts.groovy  (font cleanup)
 ```
 
-## Shared helper files: `src/output.groovy` and `src/tools.groovy`
+### The manual workflow this automates
 
-The only two files in `src/` that are not standalone scripts. Both are loaded at runtime by explicit path, resolved from the calling script's own location (never the CWD, which is the media directory):
+The scripts are an incremental automation of a process the author has been doing by hand for years. Knowing the whole of it explains design decisions that look arbitrary from the code alone, and shows which steps are still manual — that is where the remaining work is (see `ROADMAP.md`).
+
+| # | Manual step | Automated by |
+|---|---|---|
+| 1 | Review the main files' tracks (mkvmerge, or MediaInfo GUI) | `mux.groovy --identify` |
+| 2 | Decide which internal and external tracks to keep | `config.yaml` (a human decision; the tool only records it) |
+| 3 | Copy everything into one working directory, **flat** | nothing yet — see recursion in `ROADMAP.md` |
+| 4 | Bulk-rename every file to bare `SxxEyy[suffix].ext` | nothing yet — Total Commander's counter + substring rename, or by hand |
+| 5 | Fetch episode titles, then rename **all** files (mains *and* companions) | `fetch_episodes.groovy` → `rename.groovy` |
+| 6 | Separate files into groups of identical track structure (usually subdirectories) | `--check` *reports* the groups; the split is still manual |
+| 7 | Mux each group with its own track settings | `mux.groovy`, one `config.yaml` per group — originally the mkvmerge command line edited inside the script itself, per group |
+
+Consequences worth knowing before changing anything:
+
+- **Step 4 is why `rename.groovy` does not need to parse exotic names.** By the time it runs, every file is already `SxxEyy[suffix].ext`. A release like `[Salender-Raws] Hellsing OVA - 05 (...)` becomes `S01E05[Salender-Raws].mka` first — which is why the `s(\d\d)\.?e(\d\d)` regex being strict has never been a problem in practice, and why automating step 4 (not loosening step 5) is the right fix.
+- **Step 5 renames companions too**, which is why `rename.groovy`'s extension list covers `.mka`/`.ass`/`.srt`/`.idx`/`.sub` and why `parseSuffix` preserves a trailing `[...]`. The suffix is what identifies which dub or subtitle group a companion belongs to, and it has to survive the rename.
+- **That pairing is what makes `${fileName}[Studio].mka` the canonical `additionalSources` pattern**: after step 5 a companion's name is the main file's name plus the suffix, so the placeholder resolves exactly. It is a consequence of steps 3-5, not a convention chosen for its own sake.
+- **Step 7's "one config per group" is why the config is per-directory**, next to the media rather than next to the script.
+- **The config system exists because in-place editing was destructive.** Step 7 was originally done by editing the mkvmerge command line inside the script for each group. The script was not under version control at the time, so a botched edit destroyed the working invocation with nothing to recover it from — which happened more than once, and is what motivated lifting track selection out into `config.yaml`. Worth knowing before proposing anything that moves configuration back into the scripts.
+- **Step 2's "no one size fits all" is why this is editable scripts plus config files rather than a GUI**: adapting the tool to the files is usually cheaper than adapting the files to the tool — though sometimes (step 4) adapting the files is unavoidable.
+
+## Shared helper files: `src/output.groovy`, `src/tools.groovy`, `src/episodes.groovy`
+
+The only three files in `src/` that are not standalone scripts. All are loaded at runtime by explicit path, resolved from the calling script's own location (never the CWD, which is the media directory):
 
 ```groovy
 def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
 def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)   // 'auto' literal in scripts without --color
 def findMkvTool = evaluate(new File(scriptDir, 'tools.groovy'))
+def episodes = evaluate(new File(scriptDir, 'episodes.groovy'))
 ```
 
-**Never reference these as classes** (`Output.foo()` style). Groovy's implicit sibling-class resolution is CWD- and invocation-dependent — that failure mode is why earlier attempts at shared helpers in this project were abandoned. Explicit `evaluate()` by absolute path (the same script-location resolution `fetch_episodes.groovy` uses for `apikey.txt`) has no such dependence and works identically under the `bin/` wrappers, foreign CWDs, and both CI legs. Both files have **no `@Grab` and no imports**, so loading them never touches the network or the caller's classloader setup (`@GrabConfig(systemClassLoader = true)` is unaffected), and each file's last expression is its exported value: a factory closure in `output.groovy` (call it with the color mode, get a map of helpers), the `findMkvTool` closure itself in `tools.groovy`. The test harness loads both via its `repoRoot`.
+**Never reference these as classes** (`Output.foo()` style). Groovy's implicit sibling-class resolution is CWD- and invocation-dependent — that failure mode is why earlier attempts at shared helpers in this project were abandoned. Explicit `evaluate()` by absolute path (the same script-location resolution `fetch_episodes.groovy` uses for `apikey.txt`) has no such dependence and works identically under the `bin/` wrappers, foreign CWDs, and both CI legs. All three have **no `@Grab` and no imports**, so loading them never touches the network or the caller's classloader setup (`@GrabConfig(systemClassLoader = true)` is unaffected), and each file's last expression is its exported value: a factory closure in `output.groovy` (call it with the color mode, get a map of helpers), the `findMkvTool` closure itself in `tools.groovy`, a map of closures in `episodes.groovy`. The test harness loads them via its `repoRoot`.
+
+`episodes.groovy` owns the episode-metadata *shape*, not its I/O: `parseSeasonEpisode` (the shared `s(\d\d)\.?e(\d\d)` regex, the join key between a file and its episode — `rename.groovy` delegates to it rather than keeping its own copy), `parseCanonicalName` (the inverse of rename's `Show - SxxEyy - Title[suffix]` output), `sanitizeForFilename`, `indexFromLines`, and `normalizeYaml`. **`normalizeYaml` takes an already-parsed map, never a file** — the no-imports rule means snakeyaml cannot be imported here, so callers own the reading and parsing and this file owns the semantics. That seam is deliberate; do not "fix" it by adding a `@Grab`.
 
 `output.groovy` owns the palette — red 31 errors/failure summaries, green 32 success (`*** Done`, clean summaries, `[PASS]`), yellow 33 warnings + the `--check` differing-cell highlight, cyan 36 section/file/table-column headers, gray 90 de-emphasis of the `--check` file-evidence lists (never an accent) — plus the gating (`always`, or `auto` on a terminal without `NO_COLOR`; anything else is `never`) and the shared message forms: `error(msg)`/`warn(msg)` print `*** Error: `/`*** Warning: ` to **stderr**; `header`/`success` print to stdout; `plural(n, noun)` lives here too. The terminal probe calls `Console.isTerminal()` where it exists (JDK 22+ returns a Console even when piped), falling back to the plain null-check on JDK 11/21.
 
@@ -117,7 +163,24 @@ The script uses picocli via `@PicocliScript2` (like `rename.groovy` and `fetch_e
 
 Lazy GString closures (`${-> fileName}`) are used throughout `buildCommandLine` so that `fileName` and `extension` are evaluated at command execution time, not at closure definition time.
 
-`additionalSources` entries support a `${fileName}` placeholder that resolves to the base filename of the current main source file, enabling per-episode companion files like `${fileName}[Studio].mka`.
+**Substitution variables.** Every templated config value (`general.title`, the three kinds of track `title`, and `additionalSources[].file`) goes through one engine, including the `${fileName}` placeholder in companion paths. Keep it that way: resolution done inline at a use site is a second implementation that will drift from the validated variable set.
+
+Placement: the engine sits **between `probeFile` and `identifyFile`**, and that position is forced from both directions. It needs `probeFile` for `${codec}`, and `identifyFile` needs *it* for the companion sub-tables — the usual closure-capture-at-definition-time rule, now constraining the order in two directions at once. `probedInfos` (the probe cache) is declared there too, far above the loop that fills it, for the same reason; it is **not** named `infos`, because several check closures already take a parameter by that name and a script-level `def infos` makes those a duplicate-parameter compile error.
+
+Two-stage validation, and the split matters:
+
+- **Stage one is config-static and fatal (exit 2)**, running in every mode before anything is probed. An unknown variable name, a track variable in a file-scope field, a malformed body (`${var:modifier}` — caught by scanning with a deliberately looser `\$\{[^}]*\}` so it cannot survive as a literal), or a `language` with no display name. A typo would otherwise be stamped into the track names of a whole season.
+- **Stage two is per-file and drops** (`--strict` aborts): a valid variable with no data for one episode. That is data-shaped — TheMovieDB missing episode 25, a stray un-renamed file — and matches the companion pre-flight's philosophy, which it sits directly beside and shares `formatFileList` with. Both run before `mkdirs()`.
+
+Resolution is **eager** inside `buildCommandLine`, which now takes the `File`: the closure is already re-invoked per file after `fileName` is set, so no lazy-GString machinery is needed for substituted values. The output path and main-source path keep their `${-> fileName}` lazies untouched.
+
+`${languageName}`/`${languageNative}` come from the JDK's CLDR data via `Locale`, keyed by both the two-letter codes config.yaml uses and the three-letter codes Matroska carries, plus the ~20 ISO 639-2/B bibliographic codes that differ from /T (`ger`, `fre`, `dut`, …). Native names are upper-cased with the locale's own rules, since many languages spell their own name in lower case (`русский` → `Русский`).
+
+**`${codec}` keys on `properties.codec_id`, not on mkvmerge's `codec` display string.** The display string is not stable across versions — mkvmerge v99 reports `AVC/H.264/MPEG-4p10` where older releases report the components in the opposite order — and CI runs both a distro mkvtoolnix and the newest release, so a display-keyed map would resolve differently per leg. Second tier is a small display-string map, needed because a raw non-Matroska companion has **no `codec_id` at all** (a bare `.ass` probes with an empty `codec_id` and only `SubStationAlpha`); third tier is the raw display string, so unmapped codecs degrade rather than break. Probing for `${codec}` is gated on the config actually using it and reuses `probedInfos`, so a run without it costs no extra subprocesses.
+
+`--check` prints templates **unresolved** on purpose (`configTitleFor`): the report is batch-level and cannot resolve a per-file variable, and its job there is to identify which config entry a finding refers to.
+
+**`--identify` also lists configured companions.** When a config is available it resolves each `additionalSources[].file` for that episode through the substitution engine and prints the resolved path plus a probed sub-table. Never fatal: a companion that is not there prints `(not found)`, because `--identify` describes what exists rather than asserting it. The LANG cell falls back to `-` since raw `.ass`/`.srt` companions carry no language at all.
 
 **Consistency check (`--check`, and the default pre-flight).** Compares track structure across the whole batch and reports it before muxing. One `mkvmerge -J` per file via `probeFile`, shared by `--identify` and `--check` so combining them does not double the subprocesses (`identifyFile` was refactored to take a probed record rather than shell out itself). A live `*** Reading N file(s)...` tick prints during probing, since that is seconds of silence on a slow share.
 
@@ -148,6 +211,7 @@ When adding a wrapper, two things are easy to get wrong and are not caught by CI
 |-------|---------|
 | `general.mkvmergeExe` | Optional full path to mkvmerge; omit to auto-detect from PATH (with a fallback to the default Windows install location) |
 | `general.destinationDir` | Output folder (relative to CWD when script runs) |
+| `general.title` | Optional segment (container) title, templated. Omit for the current default, the file name. Distinct from `mainSource.videoTrack.title` — each defaults to the file name independently |
 | `general.allowedExtensions` | Which file types to treat as main sources |
 | `mainSource.videoTrack` | Language and optional title override for the video track |
 | `mainSource.audioTracks[]` | List of audio track IDs to include, with language/title/default |
