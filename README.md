@@ -14,8 +14,8 @@ It is deliberately narrow in scope — each script does one thing, operates on t
 current directory, and is small enough to read and adapt in a few minutes.
 
 ```
-mkv-mux --identify        # what tracks does this file have?
-mkv-mux --check           # are all the episodes structured the same?
+mkv-inspect --identify    # what tracks does this file have?
+mkv-inspect               # are all the episodes structured the same?
 mkv-mux --dry-run         # what would be muxed, exactly?
 mkv-mux                   # do it
 ```
@@ -46,8 +46,10 @@ flowchart TD
     EP --> REN["rename.groovy"]
     EP --> MKV
     REN --> FILES["Show - SxxEyy - Title.ext"]
+    FILES --> INSP["inspect.groovy"]
     FILES --> MKV["mux.groovy"]
-    CFG["config.yaml"] --> MKV
+    INSP -.-> CFG["config.yaml"]
+    CFG --> MKV
     MKV --> MERGE[mkvmerge] --> OUT["muxed MKV in destinationDir"]
     OUT --> POST["post-processing utilities"]
 ```
@@ -73,6 +75,7 @@ export PATH="$PATH:/path/to/mkv-scripts/bin"
 Then, from any directory:
 
 ```
+mkv-inspect                          # what is in these files?
 mkv-mux                              # instead of: groovy .../src/mux.groovy
 mkv-rename "Show Name"
 mkv-propedit --edit track:a2 --set flag-forced=0
@@ -81,6 +84,7 @@ mkv-propedit --edit track:a2 --set flag-forced=0
 | Command | Script |
 |---------|--------|
 | `mkv-mux` | `mux.groovy` |
+| `mkv-inspect` | `inspect.groovy` |
 | `mkv-fetch-episodes` | `fetch_episodes.groovy` |
 | `mkv-rename` | `rename.groovy` |
 | `mkv-filename-to-title` | `filename_to_title.groovy` |
@@ -105,7 +109,8 @@ suite is run from the repo root:
 
 | Script | Purpose |
 |--------|---------|
-| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--identify` lists tracks, `--check` compares track structure across the batch, `--dry-run` prints commands without running them, and file names or globs (plus `--exclude`) narrow the batch. |
+| `mux.groovy` | The core muxer: builds and runs an `mkvmerge` command for every media file in the current directory, driven by `config.yaml`. `--dry-run` prints commands without running them, and file names or globs (plus `--exclude`) narrow the batch. |
+| `inspect.groovy` | Looks at the files and reports; changes nothing and needs no config. The default run compares track structure across the batch, `--identify` prints a track table per file. |
 | `fetch_episodes.groovy` | Fetches episode names for a show/season from TheMovieDB and writes `episodes.txt`. |
 | `rename.groovy` | Batch-renames files to `Show - SxxEyy - Title.ext` using `episodes.txt`. |
 | `filename_to_title.groovy` | Sets the MKV segment title and video track name to the file name (via `mkvpropedit`). |
@@ -158,6 +163,7 @@ nonexistent season prints TheMovieDB's own message and exits non-zero.
 groovy src/rename.groovy                          # show name from episodes.yaml
 groovy src/rename.groovy "Show Name" [episodeOffset]
 groovy src/rename.groovy "Show Name" --dry-run    # preview, rename nothing
+groovy src/rename.groovy "Show Name" --external   # rename the dubs and subs too
 ```
 
 Renames every media/subtitle file whose name contains an `sXXeYY` pattern to
@@ -187,14 +193,39 @@ collide with another rename, every problem is listed and nothing is touched.
 This matters because renaming removes the `sXXeYY` pattern that ties a file to
 its episode, so a rename that failed halfway would have to be untangled by hand.
 
-`--dry-run` prints the planned `old -> new` pairs and exits.
+#### Renaming external files too
+
+External files — a dub under `Rus sound/[Studio]/`, a `.rus.srt` sibling — are
+found by carrying the *main file's* base name. Renaming the episodes without them
+therefore breaks exactly the relationship that made them findable, so `--external`
+renames them along with their episode:
+
+```
+Show/
+  S01E01.mkv                            -> My Show - S01E01 - Pilot.mkv
+  S01E01.rus.srt                        -> My Show - S01E01 - Pilot.rus.srt
+  Rus sound/[Studio]/S01E01.mka         -> Rus sound/[Studio]/My Show - S01E01 - Pilot.mka
+```
+
+Each file keeps its own suffix, verbatim, and stays in its own directory — the
+directory is what identifies which dub group it belongs to, and nothing is
+normalised or invented. Off by default: leaving external files alone is a
+legitimate choice, and `mkv-inspect` can still match them to their episodes by
+episode number afterwards.
+
+The whole-batch guarantee extends across the tree: if any file anywhere in it
+would overwrite something, nothing is renamed at all. Files matched only by
+episode number are reported and skipped, since their names carry no relation to
+the main file's and so have no suffix to preserve.
+
+`--dry-run` prints the planned `old -> new` pairs and exits; with `--external`
+the left-hand side is the file's path, so it is clear which directory's copy is
+being renamed.
 
 ### mux.groovy
 
 ```
 groovy src/mux.groovy                          # check, then mux every matching file
-groovy src/mux.groovy --identify               # list tracks per file, mux nothing
-groovy src/mux.groovy --check                  # compare tracks across files, mux nothing
 groovy src/mux.groovy --dry-run                # print the mkvmerge command per file, run nothing
 groovy src/mux.groovy "Show.S01E0[12].mkv"     # only the files matching a pattern
 groovy src/mux.groovy --exclude "*.sample.mkv" # everything except the files matching a pattern
@@ -206,16 +237,17 @@ for each one. Output goes to `destinationDir`. If a file fails, the error is
 printed and processing continues with the next file.
 
 Titles in the config can be templates rather than fixed strings — see
-[Substitution variables](#substitution-variables). `--identify` also lists the
-tracks of any companion files the config declares, with the path each pattern
-resolved to for that episode and a `(not found)` line where one is missing.
+[Substitution variables](#substitution-variables). To look at the files rather
+than mux them — track tables, the batch structure report — use
+[`inspect.groovy`](#inspectgroovy); it needs no config and changes nothing.
 
 #### Selecting a subset of the files
 
 Positional arguments narrow the batch to the files you name; `--exclude` drops
 files from it. Both accept an exact file name or a glob, both may be repeated,
-and both apply in every mode — including `--identify` and `--dry-run`. With no
-arguments the behaviour is unchanged: every file in the directory.
+and both apply in every mode, `--dry-run` included. With no arguments the
+behaviour is unchanged: every file in the directory. `inspect.groovy` takes the
+same arguments.
 
 ```
 groovy src/mux.groovy Show.S01E03.mkv                        # one file
@@ -229,15 +261,15 @@ literally, so a file called `Odd[1].mkv` selects only itself rather than being
 read as a character class. A pattern that matches nothing is reported, so a typo
 does not look like a successful run with no work to do.
 
-#### Companion file pre-flight
+#### External file pre-flight
 
 When `additionalSources` uses the `${fileName}` placeholder, every companion is
 checked for existence before anything is muxed. Episodes whose companions are
 missing are named and skipped; the rest of the batch is muxed normally.
 
 ```
-*** 2 file(s) will be skipped: companion files are missing
-      ${fileName}[Studio].mka  (missing for 2 file(s))
+*** 2 files will be skipped: companion files are missing
+      ${fileName}[Studio].mka  (missing for 2 files)
         Show.S01E13.mkv, Show.S01E14.mkv
 ```
 
@@ -248,7 +280,87 @@ processed. Those episodes would have failed anyway, so nothing is lost by
 skipping them — this never aborts the run. If every episode is blocked, the run
 says so instead of printing a bare `Done`.
 
-#### Consistency check
+#### Pre-flight consistency check
+
+Before muxing, the batch is compared for track-structure consistency — the same
+report `inspect.groovy` prints, run here because a discrepancy at a selected
+track ID means muxing the wrong dub into a whole season. Skip it with
+`--no-check`; make it fatal with `--strict`, which exits 2 without muxing
+anything when a discrepancy affects a track `config.yaml` selects. The report
+itself is documented under [`inspect.groovy`](#inspectgroovy) below.
+
+### inspect.groovy
+
+```
+groovy src/inspect.groovy                        # compare track structure across the batch
+groovy src/inspect.groovy --identify             # print a track table per file
+groovy src/inspect.groovy --identify --check     # both, from one scan
+groovy src/inspect.groovy "Show.S01E0[12].mkv"   # only the files matching a pattern
+```
+
+Reports on the files and changes nothing — no output directory, no renames, no
+remux. A `config.yaml` is optional: without one you get the structure of what is
+there, which is what you read to *write* the config; with one, findings are also
+classified against the tracks it selects and configured sources are resolved per
+episode.
+
+Nothing about a config can stop it. Missing, empty, malformed, or valid with a
+typo in a template — each is reported and the run continues without it, because a
+stale config in the directory should never stand between you and the track table,
+least of all when reading that table is how you would fix the config. The exit
+code is 0 unless you pass `--strict`.
+
+#### External files
+
+Dubs and subtitle variants usually do not sit next to the episodes — anime
+releases put them in per-studio folders, TV releases use suffixed siblings. Both
+are found by name, no config required, and grouped into **variants**: one dub
+group, one subtitle group, one suffix.
+
+```
+*** External files: 3 variants discovered
+  LBL  TYPE       VARIANT     PATTERN                         FILES
+  A    subtitles  rus         <name>.rus.srt                  1
+  B    audio      [MC-Ent]    Rus sound/[MC-Ent]/<name>.mka   4
+  C    audio      [Омикрон]   Rus sound/[Омикрон]/<name>.mka  10
+  C    subtitles  [Омикрон]   Rus subs/[Омикрон]/<name>.ass   10
+```
+
+Each episode's table then lists its own external files by label, so a long path
+is printed once rather than under every episode:
+
+```
+  + [C] [Омикрон] (.mka, .ass)
+  0    audio      AAC                    rus   no   no   Omikron dub
+  0    subtitles  ASS                    rus?  -    -
+```
+
+Files that carry metadata mkvmerge can read (`.mka`, `.mks`, `.idx`, `.flac`) are
+probed for it; the rest are described from their name, with the language guessed
+from the folder or suffix and marked `rus?` so a guess is never mistaken for a
+tag. Any spelling works — `Rus sound`, `Ru subs`, `Russian`, `Русский` — and an
+untagged file (`und`) falls back to the guess rather than reporting nothing
+useful. Files matched only by episode number, and files matching nothing at all,
+are reported as such and never quietly paired up.
+
+In the check report they are **part of the layout**, because they are part of a
+muxing pass. Episodes with identical tracks but different dubs available are
+different jobs, and the grouping says so — which is the question you actually
+arrived with:
+
+```
+*** Layout 1 (6 files - episodes 05-10): video, audio, subs + B C E F
+*** Layout 2 (4 files - episodes 01-04): video, audio, subs + A C E F
+```
+
+Two groups, two configs, and each says which episodes it covers — worked out from
+the file names even when they carry no `SxxEyy`, as anime releases usually do not. `Track structure and external files are consistent
+across 23 files` means one config does the whole season.
+
+Discovery never feeds muxing: `mux.groovy` is driven by `additionalSources` and
+nothing else. This is what you read in order to write those entries. Full rules —
+matching, merging, what is probed — are in the
+[reference](docs/reference.md#external-file-discovery).
 
 `config.yaml` selects tracks by **numeric ID**, which quietly assumes every
 episode in the directory has the same track layout. When that breaks — a
@@ -256,11 +368,12 @@ translation added mid-season, an old one dropped, a different release group
 ordering tracks differently — mkvmerge does not complain; it muxes whatever sits
 at that ID, and you discover the wrong dub at playback time.
 
-The consistency check compares track structure across the whole batch and reports
-it before muxing. It runs automatically (skip it with `--no-check`), or on its own
-with `--check`, which muxes nothing and needs no `config.yaml` — so you can inspect
-a season's structure before writing one. `--check` and `--identify` can be combined;
-they answer different questions and share one `mkvmerge` scan.
+The consistency check compares track structure across the whole batch. It is what
+a bare `mkv-inspect` run does, and `mux.groovy` runs the same report as its
+pre-flight. No `config.yaml` is needed — so you can inspect a season's structure
+before writing one — and with one present each finding is additionally classified
+against the tracks it selects. `--check` and `--identify` can be combined; they
+answer different questions and share one `mkvmerge` scan.
 
 Files are first grouped by **track layout** — a shifted track order or a missing
 track forms its own group — and the **values** at each ID (codec, language, name,
@@ -271,7 +384,7 @@ value:
 *** Layout 1 (20 files): video, audio, subs
     ID   TYPE   CODEC                LANG  DEF  FOR  NAME
     0    video  AVC/H.264/MPEG-4p10  eng   yes  no   -
-    1    audio  AC-3                 eng   yes  no   (no name)
+    1    audio  AC-3                 eng   yes  no   -
     2    subs   SubRip/SRT           eng   yes  no   English (SDH)
            <- Show.S01E16 - Episode Sixteen.mkv
     2    subs   SubRip/SRT           eng   no   no   English (SDH)
@@ -280,7 +393,7 @@ value:
               Show.S01E18 - Episode Eighteen.mkv
            <- Show.S01E20 - Episode Twenty.mkv
     ID   TYPE   CODEC                LANG  DEF  FOR  NAME
-    0    subs   SubRip/SRT           eng   yes  no   (no name)
+    0    subs   SubRip/SRT           eng   yes  no   -
     1    video  AVC/H.264/MPEG-4p10  eng   yes  no   -
     2    audio  AC-3                 eng   yes  no   English (SDH)
 
@@ -296,8 +409,8 @@ value:
   reference.
 - With a `config.yaml` present, each difference is classified as **blocking**
   (it lands on a track the config selects) or informational.
-- By default the check warns and continues; `--strict` aborts with exit 2 on any
-  blocking discrepancy, and `--check-verbose` prints untruncated file lists.
+- `--check-verbose` prints untruncated file lists; `--strict` exits 2 on any
+  blocking discrepancy (in `mux.groovy` that also means nothing is muxed).
 
 The full reading guide — what is compared and ignored, the exact
 blocking-vs-informational rules, colours — is in the
@@ -316,13 +429,12 @@ every matching file:
   4    subtitles  SubRip/SRT             eng   yes  no   Subtitle A
 ```
 
-`--dry-run` prints the exact command that would be run, which is the quickest
-way to check track selection and `${fileName}` companion resolution before
-committing to a long mux. Both flags leave the filesystem untouched — not even
-`destinationDir` is created.
-
-The printed command is meant for reading, not for pasting: mkvmerge's `(` and
-`)` source-grouping tokens are not shell-safe as written.
+Nothing here writes anything: `inspect.groovy` has no output directory and never
+creates one. (`mux.groovy --dry-run` is the equivalent for the command line
+itself — it prints the exact `mkvmerge` invocation, which is the quickest way to
+check track selection and `${fileName}` resolution before committing to a long
+mux. That command is meant for reading, not pasting: mkvmerge's `(` and `)`
+source-grouping tokens are not shell-safe as written.)
 
 ### propedit.groovy
 
@@ -383,7 +495,7 @@ excluded, and line endings survive conversion. The full rationale is in the
 directory, or `--config <path>`. Quick start:
 
 1. Copy `src/config.example.yaml` next to your media files as `config.yaml`.
-2. Run `mkv-mux --identify` to see each file's track IDs.
+2. Run `mkv-inspect --identify` to see each file's track IDs.
 3. Keep the tracks you want, delete the rest:
 
 ```yaml
@@ -395,7 +507,7 @@ mainSource:
   videoTrack:
     language: "ja"                # title defaults to the file name
   audioTracks:
-    - id: 1                       # ID from mkv-mux --identify
+    - id: 1                       # ID from mkv-inspect --identify
       language: "ja"
       title: "Japanese"
       default: true
@@ -485,7 +597,7 @@ batch is muxed, the same way a missing companion file is handled. `--strict`
 turns that into an abort as well.
 
 There is no escape syntax, so a literal `${...}` cannot currently be written in
-a title. `--check` prints templates unresolved, on purpose: its report runs
+a title. The check report prints templates unresolved, on purpose: it runs
 across the whole batch and identifies *which config entry* a finding refers to.
 
 ## Tests

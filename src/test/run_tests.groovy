@@ -39,7 +39,7 @@ def workRoot  = new File(scriptDir, 'work')
 
 // Shared colour helpers — auto mode: coloured on a dev terminal, plain when
 // piped (CI logs) or under NO_COLOR. See src/output.groovy.
-def ui = evaluate(new File(repoRoot, 'src/output.groovy'))('auto')
+def ui = evaluate(new File(repoRoot, 'src/lib/output.groovy'))('auto')
 
 def isWindows = System.getProperty('os.name').toLowerCase().contains('win')
 def groovyBin = isWindows ? 'bin/groovy.bat' : 'bin/groovy'
@@ -48,7 +48,7 @@ def groovyExe = new File(System.getProperty('groovy.home', ''), groovyBin).with 
 }
 
 // Shared with the scripts under test; see src/tools.groovy.
-def findMkvTool = evaluate(new File(repoRoot, 'src/tools.groovy'))
+def findMkvTool = evaluate(new File(repoRoot, 'src/lib/tools.groovy'))
 
 def mkvmergeExe = mkvmergeExeOverride ?: findMkvTool('mkvmerge')
 
@@ -186,6 +186,59 @@ def stageInput = { File workDir, String name = 'test.mkv' ->
     dest
 }
 
+/** Write a text external file (subtitles) at a path relative to workDir,
+ *  creating directories as needed. The content is deliberately unimportant:
+ *  nothing probes these formats, which is half of what the discovery tests
+ *  assert. */
+def stageExternalText = { File workDir, String relPath, String text = "1\n00:00:01,000 --> 00:00:02,000\nHi\n" ->
+    def f = new File(workDir, relPath)
+    f.parentFile?.mkdirs()
+    f.setText(text, 'UTF-8')
+    f
+}
+
+/** Extract one track of test.mkv to a path relative to workDir, for the external
+ *  files that DO get probed (.mka/.mks carry real language and track names).
+ *  Pass a language to override the extracted track's own — 'und' is how Matroska
+ *  spells "untagged", which is what the path-based language guess is for. */
+def stageExternalTrack = { File workDir, String relPath, String trackType, int trackId,
+                           String language = null ->
+    def dest = new File(workDir, relPath)
+    if (language == null) {
+        extractTrack(testMkv, dest, trackType, trackId)
+        return dest
+    }
+    dest.parentFile?.mkdirs()
+    def flag   = trackType == 'audio' ? '--audio-tracks' : '--subtitle-tracks'
+    def noFlag = trackType == 'audio' ? '--no-subtitles' : '--no-audio'
+    def (code, out) = exec([mkvmergeExe, '--output', dest.absolutePath, '--no-video', noFlag,
+                            flag, "$trackId", '--language', "${trackId}:${language}",
+                            testMkv.absolutePath])
+    assert (code == 0 || code == 1) : "stageExternalTrack failed (exit $code):\n$out"
+    dest
+}
+
+/** The shared multi-directory fixture, modelled on a real anime release: three
+ *  episodes, two dub groups with different coverage, one of them also supplying
+ *  subtitles from a second category directory (the merge case), a suffixed
+ *  sibling in the media directory itself, one file belonging to nothing, and an
+ *  extras folder holding a stray .mkv. */
+def stageTree = { File workDir ->
+    ['01', '02', '03'].each { ep ->
+        stageInput(workDir, "Show - S01E${ep} - Title.mkv".toString())
+        stageExternalTrack(workDir, "Rus sound/[GroupA]/Show - S01E${ep} - Title.mka".toString(), 'audio', 3)
+    }
+    ['01', '02'].each { ep ->
+        stageExternalText(workDir, "Rus subs/[GroupA]/Show - S01E${ep} - Title.ass".toString())
+    }
+    // Untagged on purpose: Matroska reports it as 'und', which has to fall back
+    // to the folder's language guess.
+    stageExternalTrack(workDir, 'Rus sound/[GroupB]/Show - S01E01 - Title.mka', 'audio', 2, 'und')
+    stageExternalText(workDir, 'Show - S01E01 - Title.rus.srt')
+    stageExternalText(workDir, 'Rus subs/[GroupA]/Bonus.ass')
+    stageInput(workDir, 'extras/Sample.mkv')
+}
+
 /** Run any script from the repo's src/ in workDir; return [exitCode, output].
  *  The output is also kept for diagnostics if the test fails. */
 def runScript = { String scriptName, File workDir, List extraArgs = [], Map env = [:] ->
@@ -199,6 +252,11 @@ def runScript = { String scriptName, File workDir, List extraArgs = [], Map env 
 /** Run mux.groovy from workDir; return [exitCode, output]. */
 def runMkvGroovy = { File workDir, List extraArgs = [] ->
     runScript('mux.groovy', workDir, extraArgs)
+}
+
+/** Run inspect.groovy from workDir; return [exitCode, output]. */
+def runInspect = { File workDir, List extraArgs = [] ->
+    runScript('inspect.groovy', workDir, extraArgs)
 }
 
 /** Find the single output MKV in workDir/<destDir>. */
@@ -751,10 +809,11 @@ runTest('24_realistic_season_episode') { workDir ->
 }
 
 // ─── 25. bin/ wrappers exist and point at real scripts ───────────────────────
-// 16 hand-written files; this catches typos for the price of a directory listing.
+// 18 hand-written files; this catches typos for the price of a directory listing.
 runTest('25_wrappers_exist_and_resolve') { workDir ->
     def wrappers = [
         'mkv-mux'                : 'mux.groovy',
+        'mkv-inspect'            : 'inspect.groovy',
         'mkv-rename'             : 'rename.groovy',
         'mkv-propedit'           : 'propedit.groovy',
         'mkv-fix-srt'            : 'fix_srt.groovy',
@@ -844,7 +903,7 @@ runTest('28_identify_lists_tracks') { workDir ->
         trackOrder: '0:0,0:2'
     ))
 
-    def (code, out) = runMkvGroovy(workDir, ['--identify'])
+    def (code, out) = runInspect(workDir, ['--identify'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('video'),     'lists the video track')
     check(out.contains('subtitles'), 'lists subtitle tracks')
@@ -1208,7 +1267,7 @@ runTest('44_file_mask_literal_beats_glob') { workDir ->
 // ─── 45. masks apply to --identify too, not just muxing ──────────────────────
 runTest('45_file_mask_applies_to_identify') { workDir ->
     stageBatch(workDir)
-    def (code, out) = runMkvGroovy(workDir, ['--identify', 'Show.S01E02.mkv'])
+    def (code, out) = runInspect(workDir, ['--identify', 'Show.S01E02.mkv'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('Show.S01E02.mkv'),  'identifies the masked file')
     check(!out.contains('Show.S01E01.mkv'), 'does not identify the others')
@@ -1472,9 +1531,9 @@ runTest('59_check_clean_batch') { workDir ->
     fullCopy(new File(workDir, 'S01E02.mkv'))
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
-    check(out.contains('consistent across all 2 file(s)'), 'reports consistent')
+    check(out.contains('consistent across 2 files'), 'reports consistent')
     check(!out.contains('<-'), 'no minority markers on a clean batch')
     check(!new File(workDir, 'mkv').exists(), '--check muxes nothing')
 }
@@ -1486,7 +1545,7 @@ runTest('60_check_name_split_grouping') { workDir ->
     fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     // The minority (one file) is named after a <- marker; the majority is not
     def arrowLines = out.readLines().findAll { it.contains('<-') }
@@ -1506,7 +1565,7 @@ runTest('61_check_never_anchors_on_first_file') { workDir ->
     fullCopy(new File(workDir, 'd.mkv'))
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     // Tokenise the flagged names — a substring test would trip on "a_odd.mkv"
     // containing "d.mkv"
@@ -1526,11 +1585,12 @@ runTest('62_check_missing_track_is_layout_outlier') { workDir ->
     buildVariant(new File(workDir, 'nosub.mkv'), [audio: [1, 2, 3], subs: [4, 5]])  // no track 6
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('different track layout'), 'reports a layout difference')
-    check(out.readLines().findAll { it.contains('<-') }.any { it.contains('nosub.mkv') },
-          'names the file with the different layout')
+    // Membership lists carry no "<-": that marker means "these rows deviate",
+    // which is a different question from "these files are in this group".
+    check(out.contains('nosub.mkv'), 'names the file with the different layout')
     check(out.contains('selected track 6'), 'blocking label names the missing selected track')
 }
 
@@ -1540,7 +1600,7 @@ runTest('63_check_video_title_ignored') { workDir ->
     fullCopy(new File(workDir, 'S01E02.mkv'), [names: [0: 'Episode Two']])
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('consistent'), 'video title differences are ignored')
 }
@@ -1551,9 +1611,9 @@ runTest('64_check_chapters_split') { workDir ->
     fullCopy(new File(workDir, 'nochap.mkv'))
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
-    check(out.contains('Chapters: present in 1 file(s), absent in 1'), 'reports the chapter split')
+    check(out.contains('Chapters: present in 1 file, absent in 1'), 'reports the chapter split')
     // Chapters are always informational, never blocking
     check(out.contains('informational'), 'chapters land under informational')
 }
@@ -1569,7 +1629,7 @@ runTest('65_check_ambiguous_duplicate') { workDir ->
     assert (c == 0 || c == 1) : "build failed:\n$o"
     writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'en', title: 'English', default: true]]))
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('Ambiguous track IDs'), 'reports the ambiguity')
     check(out.contains('cannot distinguish'), 'explains why it matters')
@@ -1585,7 +1645,7 @@ runTest('66_check_named_duplicate_not_flagged') { workDir ->
     assert (c == 0 || c == 1) : "build failed:\n$o"
     writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'en', title: 'English', default: true]]))
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(!out.contains('Ambiguous track IDs'), 'a distinguishing name suppresses the flag')
 }
@@ -1599,7 +1659,7 @@ runTest('67_check_blocking_when_selected') { workDir ->
     writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true],
                                            [id: 2, language: 'ru', title: 'Russian',  default: false]]))
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('affect tracks that config.yaml selects') ||
           out.contains('affects a track that config.yaml selects'), 'classified blocking')
@@ -1614,7 +1674,7 @@ runTest('68_check_informational_when_unselected') { workDir ->
     // config selects only track 1, so a split on track 2 cannot mis-select
     writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true]]))
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('informational'), 'classified informational')
     check(!out.contains('affect tracks that config.yaml selects') &&
@@ -1632,7 +1692,7 @@ runTest('69_check_informational_when_all_copied') { workDir ->
                                            [id: 2, language: 'ru', title: 'Russian',  default: false],
                                            [id: 3, language: 'ru', title: 'Russian 2', default: false]]))
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('informational'), 'classified informational when the whole type is copied')
 }
@@ -1694,9 +1754,9 @@ runTest('74_check_and_identify_combined') { workDir ->
     fullCopy(new File(workDir, 'S01E01.mkv'))
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--identify', '--check'])
+    def (code, out) = runInspect(workDir, ['--identify', '--check'])
     checkEquals(code, 0, 'exit code')
-    check(out.contains('Pre-flight'), 'cross-file report present')
+    check(out.contains('Consistency check'), 'cross-file report present')
     check(out.contains('*** S01E01.mkv'), 'per-file identify table present')
     check(!new File(workDir, 'mkv').exists(), 'combined mode muxes nothing')
 }
@@ -1707,7 +1767,7 @@ runTest('75_check_survives_unidentifiable_file') { workDir ->
     new File(workDir, 'broken.mkv').bytes = new byte[2048]   // zero bytes: not a media file
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('could not be identified'), 'reports the bad file')
     check(out.contains('broken.mkv'), 'names it')
@@ -1722,7 +1782,7 @@ runTest('76_check_even_split_names_all') { workDir ->
     fullCopy(new File(workDir, 'd.mkv'), [names: [2: 'Other']])
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     // With no strict majority there is no unnamed reference row, so both value
     // groups list their files. Scan the whole report for names, not just the
@@ -1751,31 +1811,35 @@ runTest('77_check_layout_grouping') { workDir ->
     writeConfig(workDir, cfg(audioTracks:    [[id: 1, language: 'ja', title: 'Japanese', default: true]],
                              subtitleTracks: [[id: 2, language: 'ja', title: 'Signs',    default: false]]))
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, 'exit code')
     check(out.contains('different track layout'), 'shifted files reported as a layout group')
 
-    def flagged = (out =~ /[\w.]+\.mkv/).collect { it } as Set
-    check('x.mkv' in flagged && 'y.mkv' in flagged, 'both shifted files named in the layout group')
-    check(!(['a.mkv', 'b.mkv', 'c.mkv'].any { it in flagged }), 'common-layout files not flagged')
+    // Every group names its files now, the largest included: each group is one
+    // muxing pass, so each is an answer. These names carry no episode number, so
+    // membership falls back to the file list.
+    def named = (out =~ /[\w.]+\.mkv/).collect { it } as Set
+    check(['x.mkv', 'y.mkv'].every { it in named }, 'the shifted files are named')
+    check(['a.mkv', 'b.mkv', 'c.mkv'].every { it in named }, 'and so are the common-layout files')
     check(out.contains('Layout 1 (3 files)'), 'the three common-layout files are the largest group')
     check(out.contains('Layout 2 (2 files)'), 'the two shifted files are their own layout group')
     // The shift lands audio/subs on IDs the config selects, so it must block
     check(out.contains('a different track layout, at selected track'), 'shift classified as blocking')
 }
 
-// ─── 78. --check-verbose implies --check and muxes nothing ───────────────────
-// It is a modifier on the report, not "mux with a verbose pre-flight" — a bare
-// --check-verbose used to fall through and mux the whole batch.
+// ─── 78. --check-verbose is a report modifier and writes nothing ─────────────
+// Inspection has no muxing path to fall through into, which is half the reason
+// it lives in its own script: a bare --check-verbose once printed the report and
+// then muxed the whole batch.
 runTest('78_check_verbose_does_not_mux') { workDir ->
     fullCopy(new File(workDir, 'a.mkv'))
     fullCopy(new File(workDir, 'b.mkv'))
     fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check-verbose'])
+    def (code, out) = runInspect(workDir, ['--check-verbose'])
     checkEquals(code, 0, 'exit code')
-    check(out.contains('Pre-flight'), 'the report is printed')
+    check(out.contains('Consistency check'), 'the report is printed')
     check(!out.contains('Processing'), 'nothing is muxed')
     check(!new File(workDir, 'mkv').exists(), 'no output directory created')
 }
@@ -1783,7 +1847,7 @@ runTest('78_check_verbose_does_not_mux') { workDir ->
 // ─── 79. a muxing run with no config.yaml is a clean error, not a stack trace ─
 // The script no longer falls back to the example config next to itself, so a
 // media directory with no config gets told what to do rather than silently
-// muxing with unrelated selections. (--check is exempt; see test 81.)
+// muxing with unrelated selections. (inspect.groovy needs no config; see test 81.)
 runTest('79_missing_config_clean_error') { workDir ->
     stageInput(workDir, 'E01.mkv')   // media present, but no config.yaml
     def (code, out) = runMkvGroovy(workDir, ['--dry-run'])
@@ -1800,12 +1864,12 @@ runTest('80_explicit_config_path') { workDir ->
     new File(cfgDir, 'show.yaml').text =
         cfg(audioTracks: [[id: 1, language: 'ja', title: 'JP', default: true]])
 
-    def (code, out) = runMkvGroovy(workDir, ['--check', '--config', 'configs/show.yaml'])
+    def (code, out) = runInspect(workDir, ['--check', '--config', 'configs/show.yaml'])
     checkEquals(code, 0, "exit code (output was:\n$out\n)")
-    check(out.contains('Pre-flight check: 1 file'), 'ran the check using the pointed-at config')
+    check(out.contains('Consistency check: 1 file'), 'ran the check using the pointed-at config')
 }
 
-// ─── 81. --check runs without a config, reporting structure but not classifying ─
+// ─── 81. the check runs without a config, reporting structure but not classifying ─
 // Useful before a config exists: check a season is consistent, then write the
 // config against it. Only a muxing run needs the config.
 runTest('81_check_without_config') { workDir ->
@@ -1813,10 +1877,10 @@ runTest('81_check_without_config') { workDir ->
     fullCopy(new File(workDir, 'b.mkv'), [names: [2: 'Other Studio']])
     // deliberately no config.yaml
 
-    def (code, out) = runMkvGroovy(workDir, ['--check'])
+    def (code, out) = runInspect(workDir, ['--check'])
     checkEquals(code, 0, "exit code (output was:\n$out\n)")
-    check(out.contains('Pre-flight'), 'the structural report still runs')
-    check(out.contains('difference(s) across the batch'), 'counts the differences it found')
+    check(out.contains('Consistency check'), 'the structural report still runs')
+    check(out.contains('difference') && out.contains('across the batch'), 'counts the differences it found')
     check(out.contains('Add a config'), 'notes that classifying them needs a config')
     check(!out.contains('config.yaml selects'), 'no blocking classification without a config')
     check(!new File(workDir, 'mkv').exists(), 'still muxes nothing')
@@ -1833,7 +1897,7 @@ runTest('82_color_always_emits_ansi') { workDir ->
     fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
     writeConfig(workDir, checkCfg())
 
-    def (code, out) = runMkvGroovy(workDir, ['--check', '--color', 'always'])
+    def (code, out) = runInspect(workDir, ['--check', '--color', 'always'])
     checkEquals(code, 0, 'exit code')
     check(out.contains("${esc}[33m"), 'differing cells and warnings are yellow')
     check(out.contains("${esc}[36m"), 'section and table headers are cyan')
@@ -1842,7 +1906,7 @@ runTest('82_color_always_emits_ansi') { workDir ->
     check(out.contains("${esc}[0m"), 'escapes are reset')
     // The whole-line/whole-cell invariant: colour must not break the pinned
     // phrases the other check tests assert on.
-    check(out.contains('*** Pre-flight check'), 'header text survives colouring intact')
+    check(out.contains('*** Consistency check'), 'header text survives colouring intact')
 }
 
 // ─── 83. --color never suppresses ANSI; explicit always beats NO_COLOR ───────
@@ -1851,7 +1915,7 @@ runTest('83_color_never_and_no_color_precedence') { workDir ->
     fullCopy(new File(workDir, 'odd.mkv'), [names: [2: 'Other Studio']])
     writeConfig(workDir, checkCfg())
 
-    def (c1, out1) = runMkvGroovy(workDir, ['--check', '--color', 'never'])
+    def (c1, out1) = runInspect(workDir, ['--check', '--color', 'never'])
     checkEquals(c1, 0, 'exit code (never)')
     check(!out1.contains("${esc}["), 'no escapes under --color never')
 
@@ -1859,7 +1923,7 @@ runTest('83_color_never_and_no_color_precedence') { workDir ->
     // --color always is a direct request and wins. NO_COLOR-under-auto cannot
     // be exercised through a subprocess at all: the pipe already turns auto
     // off, so that path is covered by every other (escape-free) test instead.
-    def (c2, out2) = runScript('mux.groovy', workDir, ['--check', '--color', 'always'], [NO_COLOR: '1'])
+    def (c2, out2) = runScript('inspect.groovy', workDir, ['--check', '--color', 'always'], [NO_COLOR: '1'])
     checkEquals(c2, 0, 'exit code (always + NO_COLOR)')
     check(out2.contains("${esc}["), 'explicit --color always beats NO_COLOR')
 }
@@ -1989,14 +2053,14 @@ runTest('89_propedit_failure_exit') { workDir ->
 // successful run that had no work — e.g. after a typo'd cd.
 runTest('90_no_media_files_reported') { workDir ->
     // Empty directory, no masks
-    def (c1, out1) = runMkvGroovy(workDir, ['--check'])
+    def (c1, out1) = runInspect(workDir, ['--check'])
     checkEquals(c1, 0, 'exit code (empty dir)')
     check(out1.contains('No media files'), 'says the directory has nothing to work on')
     check(out1.contains('mkv'), 'names the extensions it looked for')
 
     // A mask that matches a file, just not a media file
     new File(workDir, 'notes.txt').text = 'not media'
-    def (c2, out2) = runMkvGroovy(workDir, ['--identify', 'notes.txt'])
+    def (c2, out2) = runInspect(workDir, ['--identify', 'notes.txt'])
     checkEquals(c2, 0, 'exit code (non-media match)')
     check(out2.contains('No media files match: notes.txt'), 'names the fruitless pattern')
     check(!new File(workDir, 'mkv').exists(), 'no output directory created')
@@ -2366,7 +2430,7 @@ runTest('106_identify_shows_companions') { workDir ->
         trackOrder: '0:0,0:2,1:0'
     ))
 
-    def (code, out) = runMkvGroovy(workDir, ['--identify'])
+    def (code, out) = runInspect(workDir, ['--identify'])
     checkEquals(code, 0, "exit code (output was:\n$out\n)")
     check(out.contains('+ My Show - S01E01 - Pilot.rus.mka'), 'shows the resolved companion path')
     check(out.contains('(not found)'), 'reports the episode whose companion is absent')
@@ -2397,9 +2461,701 @@ runTest('107_dry_run_and_check_rendering') { workDir ->
     // the difference blocking and gets the config title printed.
     buildVariant(new File(workDir, 'My Show - S01E02 - Second.mkv'),
                  [audio: [1, 2, 3], subs: [4, 5, 6], names: [2: 'Different']])
-    def (checkCode, checkOut) = runMkvGroovy(workDir, ['--check'])
+    def (checkCode, checkOut) = runInspect(workDir, ['--check'])
     checkEquals(checkCode, 0, 'check exit code')
     check(checkOut.contains('${languageName}'), "check prints the raw template; got:\n$checkOut")
+}
+
+// ─── 108. mkv-inspect: bare run checks, --identify identifies ────────────────
+// The default mode is the batch report, since that is the question one usually
+// arrives with; --identify is the per-file drill-down and suppresses the report
+// unless --check names it too. Neither writes anything, with or without a config.
+runTest('108_inspect_default_mode') { workDir ->
+    fullCopy(new File(workDir, 'a.mkv'))
+    fullCopy(new File(workDir, 'b.mkv'))
+
+    def (bareCode, bareOut) = runInspect(workDir)
+    checkEquals(bareCode, 0, 'bare run exits 0')
+    check(bareOut.contains('Consistency check'), 'bare run prints the check report')
+    check(!bareOut.contains('*** a.mkv'), 'bare run prints no per-file table')
+
+    def (idCode, idOut) = runInspect(workDir, ['--identify'])
+    checkEquals(idCode, 0, '--identify exits 0')
+    check(idOut.contains('*** a.mkv'), '--identify prints the per-file table')
+    check(!idOut.contains('Consistency check'), '--identify alone skips the report')
+
+    def (bothCode, bothOut) = runInspect(workDir, ['--identify', '--check'])
+    checkEquals(bothCode, 0, 'combined exits 0')
+    check(bothOut.contains('Consistency check') && bothOut.contains('*** a.mkv'),
+          'naming both runs both')
+
+    check(!new File(workDir, 'mkv').exists(), 'inspection creates no output directory')
+    check(!new File(workDir, 'config.yaml').exists(), 'no config was needed at all')
+}
+
+// ─── 109. mux.groovy rejects the inspection flags it no longer owns ──────────
+// They moved to mkv-inspect outright rather than living on as aliases: two entry
+// points for one report is surface to keep in sync, and picocli already rejects
+// an unknown option clearly.
+runTest('109_mux_rejects_inspection_flags') { workDir ->
+    stageInput(workDir, 'a.mkv')
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'jpn', title: 'JP', default: true]]))
+
+    ['--identify', '--check', '--check-verbose'].each { flag ->
+        def (code, out) = runMkvGroovy(workDir, [flag])
+        check(out.contains("Unknown option: '${flag}'"), "mux names ${flag} as not its own; got:\n${out}")
+        check(!out.contains('Processing'), "mux muxed nothing for ${flag}")
+        check(!new File(workDir, 'mkv').exists(), "mux created no output directory for ${flag}")
+    }
+
+    // NOTE: picocli's script runner reports a usage error and returns without
+    // setting an exit code, so this — like every unknown option in every picocli
+    // script here — still exits 0. Asserted on the message and the absence of
+    // output instead, rather than pinning behaviour worth changing separately.
+}
+
+// ─── 110. the discovery engine's matching rules ──────────────────────────────
+// Loaded in-process rather than through a script: these are the rules both
+// mkv-inspect and mkv-rename depend on, and asserting on the data structure is
+// far more precise than reading them back out of a report.
+runTest('110_discovery_engine_matching') { workDir ->
+    def episodes = evaluate(new File(repoRoot, 'src/lib/episodes.groovy'))
+    def discovery = evaluate(new File(repoRoot, 'src/lib/discovery.groovy'))(episodes)
+
+    // Whole-word language tokens only, two- and three-letter alike.
+    checkEquals(discovery.guessLanguage(['Rus sound']), 'rus', 'three-letter token in a directory')
+    checkEquals(discovery.guessLanguage(['Ru subs']), 'rus', 'two-letter token as a word')
+    checkEquals(discovery.guessLanguage(['Ru.subs']), 'rus', 'punctuation separates words')
+    checkEquals(discovery.guessLanguage(['Rusubs']), null, 'no match inside a longer word')
+    // Spellings come from CLDR, so a language answers to its own name too.
+    checkEquals(discovery.guessLanguage(['Русский']), 'rus', 'native name in its own script')
+    checkEquals(discovery.guessLanguage(['Espanol subs', 'Español']), 'spa', 'native name with diacritics')
+    checkEquals(discovery.guessLanguage(['English subs']), 'eng', 'English name')
+    // Two-letter codes that are ordinary words are excluded on purpose.
+    checkEquals(discovery.guessLanguage(['No subs']), null, "'No' is not Norwegian")
+    checkEquals(discovery.guessLanguage(['Extras (to be done)']), null, "'to' is not a language here")
+    // Only the bare two-letter form is withheld, which is what makes the entry
+    // cheap: the language still answers to its three-letter code and both names.
+    checkEquals(discovery.guessLanguage(['UK BluRay']), null, "'UK' is a region, not Ukrainian")
+    checkEquals(discovery.guessLanguage(['Ukr sound']), 'ukr', 'but the three-letter code still matches')
+    checkEquals(discovery.guessLanguage(['Українська']), 'ukr', 'and so does the native name')
+    checkEquals(discovery.guessLanguage(['El Bosque']), null, "'El' is a Spanish article, not Greek")
+    checkEquals(discovery.guessLanguage(['Greek subs']), 'gre', 'Greek reports its bibliographic code')
+    // Dropped from BIBLIOGRAPHIC because /B and /T agree on it — the fallback to
+    // getISO3Language has to produce the same answer the table used to.
+    checkEquals(discovery.guessLanguage(['Serbian']), 'srp', 'Serbian has no separate /B code')
+    checkEquals(discovery.trimForDisplay('.rus'), 'rus', 'display trims leading punctuation')
+    checkEquals(discovery.trimForDisplay('[Studio]'), 'Studio', 'display trims brackets')
+    // Range collapsing lives in episodes.groovy, where the episode semantics are
+    // — see test 122; discovery has no business knowing about episode numbers.
+
+    // A file name that is a prefix of another main file's must attach to the
+    // longest match, not be read as the shorter one plus a suffix.
+    ['Title', 'Title 2'].each { stageInput(workDir, "Show - S01E01 - ${it}.mkv".toString()) }
+    stageInput(workDir, 'Show - S01E02 - Second.mkv')
+    stageExternalText(workDir, 'Show - S01E01 - Title 2.srt')
+    stageExternalText(workDir, 'Show - S01E01 - Title!odd{sep}.srt')
+    // Its own name relates to no main file, so only the episode number can place
+    // it — and it has to be an episode only one main file claims, since two files
+    // for E01 make that episode ambiguous by design.
+    stageExternalText(workDir, 'Rus sound/[X]/Other Release S01E02.mka')
+
+    def mains = workDir.listFiles({ it.name.endsWith('.mkv') } as FileFilter).toList().sort { it.name }
+    def result = discovery.discoverCompanions(
+        mains, discovery.walkTree(workDir, [] as Set), [mainExtensions: ['mkv'] as Set])
+
+    def byFile = [:]
+    result.variants.each { v -> v.entries.each { byFile[it.file.name] = [variant: v, entry: it] } }
+
+    checkEquals(byFile['Show - S01E01 - Title 2.srt'].entry.main.name, 'Show - S01E01 - Title 2.mkv',
+                'longest main name wins over a shorter one plus a suffix')
+    checkEquals(byFile['Show - S01E01 - Title 2.srt'].entry.suffix, '', 'and so has no suffix at all')
+    checkEquals(byFile['Show - S01E01 - Title!odd{sep}.srt'].entry.suffix, '!odd{sep}',
+                'any separator starts a suffix')
+    checkEquals(byFile['Other Release S01E02.mka'].entry.tier, 2, 'matched by episode number only')
+    checkEquals(result.unmatched.size(), 0, 'nothing else is left over')
+}
+
+// ─── 111. --identify bundles discovered external files under each episode ────
+runTest('111_identify_external_files') { workDir ->
+    stageTree(workDir)
+
+    def (code, out) = runInspect(workDir, ['--identify'])
+    checkEquals(code, 0, 'exit code')
+
+    check(out.contains('External files:'), 'the legend is printed')
+    check(out.contains('Rus sound/[GroupA]/<name>.mka'), 'legend shows the path pattern')
+    check(out.contains('Rus subs/[GroupA]/<name>.ass'),
+          'a merged variant lists both kinds of file it holds')
+    check(out.contains('<name>.rus.srt'), 'the suffix layout is a variant too')
+
+    // A probed .mka reports the language it actually carries; an unprobed .ass
+    // falls back to the directory guess, marked as a guess.
+    check(out.contains('[GroupA]'), 'variants are labelled by their directory')
+    check(out.contains('rus?'), 'a guessed language is marked with a question mark')
+    check(out.contains('ASS'), 'codec of an unprobed file comes from its extension')
+
+    // A merged variant is one block with both its files under it, not two
+    // blocks that happen to share a label.
+    check(out.contains('[GroupA] (.mka, .ass)'), "the merged variant is one block; got:\n${out}")
+
+    // The [GroupB] fixture is staged with no language, so mkvmerge reports 'und'
+    // — Matroska's only way of saying "untagged" — which has to fall back to the
+    // folder's guess. Matched as a whole track row: the fixture's own video track
+    // is genuinely undefined, and "Rus sound" contains the letters too.
+    def untagged = out.readLines().findAll { it ==~ /^\s+\d+\s+audio\s+\S+\s+und\s.*/ }
+    check(untagged.isEmpty(), "an untagged external file falls back to the guess; got: ${untagged}")
+
+    check(out.contains('Unmatched external files'), 'the leftovers are reported')
+    check(out.contains('Bonus.ass'), 'and named')
+    check(out.contains('Extras:'), 'main-type files in subdirectories are reported')
+    check(out.contains('Sample.mkv'), 'and named')
+    check(!out.contains('*** extras/Sample.mkv'), 'but never inspected as a source')
+}
+
+// ─── 112. external files are part of the layout, so they split the groups ────
+// The question the check is really asked is "how many muxing passes will this
+// season need", and an episode's external files are part of its pass. Files with
+// identical tracks but different dubs available are two jobs, and a report that
+// grouped them together would say one config where two are needed.
+runTest('112_externals_split_layout_groups') { workDir ->
+    stageTree(workDir)
+
+    def (code, out) = runInspect(workDir)
+    checkEquals(code, 0, 'exit code')
+
+    // The fixture's three episodes carry three different sets: E01 has both dub
+    // groups plus the suffixed sibling, E02 has [GroupA] audio + subs, E03 has
+    // [GroupA] audio only.
+    check(out.contains('Layout 1'), 'the batch is split into layout groups')
+    check(out.contains('Layout 3'), 'one group per distinct set of external files')
+    // The header carries the external files as labels only — the table below
+    // lists them in full, so spelling them out twice just wraps the line.
+    check((out =~ /Layout 1 [^\n]*\+ [A-Z]/).find(),
+          "the group header names its external files by label; got:\n${out}")
+
+    // Every group's table lists its external files as rows alongside the tracks,
+    // labelled by variant rather than by an ID they do not have.
+    check((out =~ /\n\s+[A-Z]\s+(audio|subs)\s+\S+/).find(),
+          "external rows sit in the table under their label; got:\n${out}")
+
+    // The legend is what decodes a label into the variant it stands for.
+    check(out.contains('[GroupA]'), 'the legend names the variant')
+
+    check(!out.contains('External file coverage'), 'the separate coverage section is gone')
+    check(!new File(workDir, 'mkv').exists(), 'still writes nothing')
+}
+
+// ─── 112b. a uniform batch stays one group, and says so about both halves ────
+runTest('112b_uniform_externals_stay_one_group') { workDir ->
+    ['01', '02'].each { ep ->
+        stageInput(workDir, "Show - S01E${ep} - Title.mkv".toString())
+        stageExternalTrack(workDir, "Rus sound/[Group]/Show - S01E${ep} - Title.mka".toString(), 'audio', 3)
+    }
+
+    def (code, out) = runInspect(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(!out.contains('Layout 2'), 'one set of external files is one group')
+    check(out.contains('Track structure and external files are consistent'),
+          "the green line now asserts both halves; got:\n${out}")
+}
+
+// ─── 112c. an external value that changes mid-season is reported ─────────────
+// The external analogue of a flag flipping halfway through a season: the same
+// dub, tagged Russian for some episodes and untagged for others.
+runTest('112c_external_value_split_reported') { workDir ->
+    ['01', '02'].each { ep -> stageInput(workDir, "Show - S01E${ep} - Title.mkv".toString()) }
+    stageExternalTrack(workDir, 'Rus sound/[Group]/Show - S01E01 - Title.mka', 'audio', 3)
+    stageExternalTrack(workDir, 'Rus sound/[Group]/Show - S01E02 - Title.mka', 'audio', 3, 'jpn')
+    // A config is what turns findings into labelled items; without one the report
+    // prints the count alone (test 81).
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'jpn', title: 'JP', default: true]]))
+
+    def (code, out) = runInspect(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(!out.contains('Layout 2'), 'both episodes carry the same external file, so one group')
+    check(out.contains('external A [Group] (audio) - language differs'),
+          "the differing value is named and attributed to its variant; got:\n${out}")
+    check(out.contains('informational'), 'an external difference never blocks')
+}
+
+// ─── 113. discovery skips dot-directories and the output directory ───────────
+// Muxed output carries the same base names as its sources, so an output folder
+// left in place would come back as an external file of the episode it was made
+// from.
+runTest('113_discovery_excludes_output_and_dot_dirs') { workDir ->
+    stageInput(workDir, 'Show - S01E01 - Title.mkv')
+    stageExternalTrack(workDir, 'mkv/Show - S01E01 - Title.mka', 'audio', 3)
+    stageExternalText(workDir, '.stash/Show - S01E01 - Title.srt')
+    stageExternalText(workDir, 'Rus subs/[Real]/Show - S01E01 - Title.ass')
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'jpn', title: 'JP', default: true]]))
+
+    def (code, out) = runInspect(workDir, ['--identify'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('[Real]'), 'a real external file is still found')
+    check(!out.contains('mkv/'), 'destinationDir is not scanned')
+    check(!out.contains('.stash'), 'dot-directories are not scanned')
+}
+
+// ─── 114. a .sub is never probed, and an idx/sub pair covers its episode once ─
+// On its own a .sub identifies as a zero-track MPEG stream, so probing it would
+// report nothing useful and cost a subprocess to do it.
+runTest('114_sub_never_probed') { workDir ->
+    stageInput(workDir, 'Show - S01E01 - Title.mkv')
+    // Deliberately not a valid VobSub pair: if anything probed these, it would
+    // show in the output as an error rather than as a clean VobSub row.
+    stageExternalText(workDir, 'Subs/[Group]/Show - S01E01 - Title.idx', 'not really an index\n')
+    stageExternalText(workDir, 'Subs/[Group]/Show - S01E01 - Title.sub', 'not really a stream\n')
+
+    def (code, out) = runInspect(workDir, ['--identify'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('VobSub'), 'both halves are described from their extension')
+    check(!out.contains('could not identify'), 'neither half is reported as unreadable')
+    check(!out.contains('Exception'), 'no stack trace')
+
+    def (checkCode, checkOut) = runInspect(workDir)
+    checkEquals(checkCode, 0, 'check exit code')
+    check(!checkOut.contains('Layout 2'), 'the pair is one episode\'s worth of external files, not two groups')
+}
+
+// ─── 115. masks narrow what is reported, not what is matched ─────────────────
+// Otherwise narrowing to one episode would dump the rest of the season's dubs
+// into "unmatched", which is exactly the opposite of what the mask asked for.
+runTest('115_masks_scope_external_display') { workDir ->
+    stageTree(workDir)
+
+    def (code, out) = runInspect(workDir, ['--identify', 'Show - S01E01 - Title.mkv'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('*** Show - S01E01 - Title.mkv'), 'the named episode is inspected')
+    check(!out.contains('*** Show - S01E02 - Title.mkv'), 'the others are not')
+    check(!out.contains('Show - S01E02 - Title.mka'), "another episode's dub is not listed")
+    check(!out.contains('Show - S01E02 - Title.ass'), "nor mis-reported as unmatched")
+}
+
+// ─── 116. mkv-rename --external renames the whole tree, or nothing ───────────
+runTest('116_rename_external_files') { workDir ->
+    ['01', '02'].each { ep ->
+        stageInput(workDir, "S01E${ep}.mkv")
+        stageExternalTrack(workDir, "Rus sound/[GroupA]/S01E${ep}.mka", 'audio', 3)
+    }
+    stageExternalText(workDir, 'S01E01.rus.srt')
+    writeEpisodes(workDir, ['First Episode', 'Second Episode'])
+
+    // Without the flag nothing outside this directory is touched at all.
+    def (plainCode, plainOut) = runScript('rename.groovy', workDir, ['My Show', '1', '--dry-run'])
+    checkEquals(plainCode, 0, 'plain dry run exit code')
+    check(!plainOut.contains('Rus sound'), 'the default run ignores subdirectories entirely')
+
+    def (dryCode, dryOut) = runScript('rename.groovy', workDir, ['My Show', '1', '--external', '--dry-run'])
+    checkEquals(dryCode, 0, 'dry run exit code')
+    check(dryOut.contains('Rus sound/[GroupA]/S01E01.mka'), 'external files are previewed by path')
+    check(dryOut.contains('My Show - S01E01 - First Episode.mka'), 'and take the new base name')
+    check(new File(workDir, 'Rus sound/[GroupA]/S01E01.mka').exists(), 'dry run renamed nothing')
+
+    def (code, out) = runScript('rename.groovy', workDir, ['My Show', '1', '--external'])
+    checkEquals(code, 0, 'exit code')
+    check(new File(workDir, 'Rus sound/[GroupA]/My Show - S01E01 - First Episode.mka').exists(),
+          'the external file is renamed in place, in its own directory')
+    check(new File(workDir, 'Rus sound/[GroupA]/My Show - S01E02 - Second Episode.mka').exists(),
+          'every episode of it')
+    check(new File(workDir, 'My Show - S01E01 - First Episode.rus.srt').exists(),
+          'a suffixed sibling keeps its suffix verbatim')
+    check(!new File(workDir, 'Rus sound/[GroupA]/S01E01.mka').exists(), 'the old name is gone')
+    check(out.contains('external'), 'the summary says how many were external')
+}
+
+// ─── 117. --external refuses everything when any target is taken ─────────────
+// The "check everything before touching anything" invariant has to hold across
+// the whole tree, not just the current directory.
+runTest('117_rename_external_collision_refuses_all') { workDir ->
+    stageInput(workDir, 'S01E01.mkv')
+    stageExternalTrack(workDir, 'Rus sound/[GroupA]/S01E01.mka', 'audio', 3)
+    // The name the external file would be renamed to is already taken.
+    stageExternalText(workDir, 'Rus sound/[GroupA]/My Show - S01E01 - First Episode.mka', 'occupied\n')
+    writeEpisodes(workDir, ['First Episode'])
+
+    def (code, out) = runScript('rename.groovy', workDir, ['My Show', '1', '--external'])
+    checkEquals(code, 1, 'exits 1')
+    check(out.contains('Refusing to rename anything'), 'refuses the whole batch')
+    check(new File(workDir, 'S01E01.mkv').exists(), 'the main file is untouched')
+    check(new File(workDir, 'Rus sound/[GroupA]/S01E01.mka').exists(), 'the external file is untouched')
+}
+
+// ─── 118. a broken config never stops mkv-inspect ────────────────────────────
+// The script reports on files; a config is an optional extra that adds
+// classification. A stale or half-written one in the directory must not stand
+// between the user and the track table — least of all when reading that table is
+// how they would fix the config.
+runTest('118_inspect_survives_broken_config') { workDir ->
+    stageInput(workDir, 'a.mkv')
+
+    def cases = [
+        'malformed' : "general:\n  destinationDir: mkv\n   bad indent: [\n",
+        'empty'     : "",
+        'not a map' : "- just\n- a list\n",
+        'bad token' : "mainSource:\n  videoTrack:\n    language: \"jpn\"\n    title: \"\${epsiodeName}\"\n",
+    ]
+
+    cases.each { label, text ->
+        new File(workDir, 'config.yaml').setText(text, 'UTF-8')
+
+        def (code, out) = runInspect(workDir, ['--identify'])
+        checkEquals(code, 0, "${label} config still exits 0")
+        check(out.contains('*** a.mkv'), "${label} config still prints the track table; got:\n${out}")
+        check(!out.contains('Exception'), "${label} config produces no stack trace")
+        check(out.contains('Warning'), "${label} config is reported as a warning; got:\n${out}")
+
+        // --strict is the one thing that turns any of it into a failure.
+        def (strictCode, strictOut) = runInspect(workDir, ['--strict'])
+        checkEquals(strictCode, 2, "${label} config exits 2 under --strict")
+        check(strictOut.contains('config problem'), "${label} config is named as the reason under --strict")
+    }
+
+    check(!new File(workDir, 'mkv').exists(), 'nothing was written at any point')
+}
+
+// ─── 119. a config that cannot be parsed is a clean error in mux ─────────────
+// mux cannot mux against a config it did not understand, so this stays fatal —
+// but as the same clean exit 2 a missing config gets, never a stack trace.
+runTest('119_mux_rejects_unusable_config') { workDir ->
+    stageInput(workDir, 'a.mkv')
+
+    ["general:\n  destinationDir: mkv\n   bad indent: [\n", "", "- just\n- a list\n"].each { text ->
+        new File(workDir, 'config.yaml').setText(text, 'UTF-8')
+        def (code, out) = runMkvGroovy(workDir, ['--dry-run'])
+        checkEquals(code, 2, 'exits 2 on a config it cannot use')
+        check(out.contains('*** Error:'), 'says what is wrong')
+        check(!out.contains('Exception'), 'no stack trace')
+        check(!new File(workDir, 'mkv').exists(), 'muxed nothing')
+    }
+}
+
+// ─── 120. an external file mkvmerge cannot read is reported, not faked ───────
+// The never-probed formats and a failed probe are different things: describing a
+// truncated .mka from its extension would present the one file that cannot be
+// muxed as the healthiest row in the table.
+runTest('120_unreadable_external_reported') { workDir ->
+    stageInput(workDir, 'Show - S01E01 - Title.mkv')
+    stageExternalText(workDir, 'Rus sound/[Group]/Show - S01E01 - Title.mka', 'not a matroska file at all\n')
+
+    def (code, out) = runInspect(workDir, ['--identify'])
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('could not read this file'), "the failure is stated; got:\n${out}")
+    check(!out.contains('0    audio      Matroska'), 'it is not dressed up as a healthy track')
+    check(!out.contains('Exception'), 'no stack trace')
+}
+
+// ─── 121. the probing progress meter, in both of its renderings ──────────────
+// Probing a season over a slow share is a long silence, so it gets a meter. The
+// two renderings exist because '\r' erases nothing in a file or a pipe: every
+// frame would be retained, smearing the log the tests themselves read.
+runTest('121_progress_meter_renderings') { workDir ->
+    // Named for the harness's own script-level `ui`, which this must not shadow.
+    def meter = evaluate(new File(repoRoot, 'src/lib/output.groovy'))('never')
+
+    def capture = { Closure body ->
+        def buffer = new ByteArrayOutputStream()
+        def previous = System.out
+        System.setOut(new PrintStream(buffer, true))
+        try { body() } finally { System.setOut(previous) }
+        buffer.toString()
+    }
+
+    def bar = capture {
+        def p = meter.progress('*** Reading 5 files', 5, [interactive: true])
+        5.times { p.tick() }
+        p.finish()
+    }
+    def frames = bar.split('\r').findAll { it.trim() }
+    checkEquals(frames.size(), 5, 'one frame per percentage change')
+    check(frames[-1].contains('100%'), "the meter reaches 100%; got:\n${bar}")
+    check(frames[-1].contains('[########################]'), 'the bar fills')
+    check(!bar.contains('█'), 'the bar is ASCII, for Windows consoles on legacy codepages')
+
+    def dots = capture {
+        def p = meter.progress('*** Reading 200 files', 200, [interactive: false])
+        200.times { p.tick() }
+        p.finish()
+    }
+    // A bare '\r' is the rewriting kind; the one in a Windows CRLF line ending is
+    // not, which is why this looks for a carriage return with no newline after it.
+    check(!(dots =~ /\r(?!\n)/).find(), "nothing is rewritten in place when redirected; got:\n${dots}")
+    check(dots.startsWith('*** Reading 200 files'), 'the label is still printed')
+    // Dots are emitted per slice of the total, not per file, so a long batch
+    // cannot wrap the terminal with hundreds of them.
+    def dotCount = dots.count('.')
+    check(dotCount > 0 && dotCount <= 50, "dots are capped for a long batch, got ${dotCount}")
+}
+
+// ─── 122. batch-relative episode labels for the layout groups ────────────────
+// Display only, and deliberately not parseSeasonEpisode: this needs the rest of
+// the batch to know where the number starts, which is exactly what makes it safe
+// (1080p and x264 sit inside the shared prefix) and exactly why it cannot answer
+// "which episode is this file" for one file on its own.
+runTest('122_batch_episode_labels') { workDir ->
+    def episodes = evaluate(new File(repoRoot, 'src/lib/episodes.groovy'))
+    def label = { List names -> episodes.formatRanges(episodes.batchLabels(names).values()) }
+
+    checkEquals(label((1..4).collect { "My Show - S01E0${it} - Title".toString() }), '01-04',
+                'an SxxEyy batch uses the episode number')
+    checkEquals(label((1..10).collect {
+        "[Salender-Raws] Hellsing OVA - ${String.format('%02d', it)} (BD 1920x1080 x264 5.1 FLAC)".toString()
+    }), '01-10', 'a plain numbered batch is anchored on its common prefix')
+
+    // The prefix of 10..19 ends mid-number, so the trailing digits have to come
+    // off it or the batch reads as 0-9.
+    checkEquals(label((10..19).collect { "Show - ${it}".toString() }), '10-19', 'trailing digits are trimmed')
+    checkEquals(label((1..9).collect { "Show - 0${it}".toString() }), '01-09', 'padding survives the trim')
+    checkEquals(label((1..3).collect { "Hellsing${it}".toString() }), '1-3', 'no separator is still a number')
+    checkEquals(label((1..3).collect { "Show (2024) 0${it}".toString() }), '01-03',
+                'a number in the show name is inside the prefix, so it cannot be mistaken for one')
+    checkEquals(label(['Show - 01', 'Show - 02', 'Show - 05']), '01-02, 05', 'gaps break the run')
+    checkEquals(episodes.batchLabels(['Alpha', 'Beta']), [:], 'an unnumbered batch has no labels at all')
+
+    // The line a layout-group header carries, composed here rather than in each
+    // caller: inspect.groovy's report and mux.groovy's pre-flight are the same
+    // report and must render a group identically. The real ui.pluralize is used
+    // rather than a stub, so this cannot drift from what the scripts pass in.
+    //
+    // It yields the noun and the ranges, with no count of its own: the caller
+    // has already printed one ("6 files - episodes 05-10"), which is exactly the
+    // job pluralize exists for as against plural.
+    checkEquals(episodes.membershipLabel((1..3).collect { "Show - S01E0${it} - T".toString() }, ui.pluralize),
+                'episodes 01-03', 'membershipLabel composes the noun and the ranges')
+    checkEquals(episodes.membershipLabel(['Show - S01E01 - T'], ui.pluralize), 'episode 01',
+                'and agrees in number with what it found')
+    checkEquals(episodes.membershipLabel(['Alpha', 'Beta'], ui.pluralize), null,
+                'declining when the batch is not numbered, so the caller falls back to file names')
+}
+
+// ─── 123. every layout group names its files, the largest included ───────────
+// The old report left the majority unnamed because its job was spotting
+// outliers. Now the job is "here are your muxing passes and what goes in each",
+// and the first group is as much an answer as the others.
+runTest('123_every_group_names_its_files') { workDir ->
+    ['01', '02', '03', '04'].each { ep ->
+        stageInput(workDir, "Show - S01E${ep} - Title.mkv".toString())
+        stageExternalTrack(workDir, "Rus sound/[Both]/Show - S01E${ep} - Title.mka".toString(), 'audio', 3)
+    }
+    // Only the first two episodes have the second dub, so the batch splits 2/2.
+    ['01', '02'].each { ep ->
+        stageExternalTrack(workDir, "Rus sound/[Early]/Show - S01E${ep} - Title.mka".toString(), 'audio', 2)
+    }
+
+    def (code, out) = runInspect(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('episodes 01-02'), "the group with both dubs names its episodes; got:\n${out}")
+    check(out.contains('episodes 03-04'), 'and so does the other one, though it is not an outlier')
+    // A numbered batch puts membership in the header, so the whole plan reads off
+    // the "***" lines. It is not a deviation list, so it carries no "<-" marker.
+    def headers = out.readLines().findAll { it.contains('*** Layout') }
+    check(headers.every { it.contains('episodes ') }, "every group header names its episodes; got:\n${out}")
+    check(headers.every { !it.contains('<-') }, 'membership carries no deviation marker')
+}
+
+// ─── 124. the video title is shown but never compared ────────────────────────
+// It routinely carries the episode name, so comparing it would report every file
+// in the season as deviant — but hiding it entirely threw away something worth
+// seeing. A video row stands for every file in its group, so there is only "the"
+// title when they all agree; when they do not, say so rather than picking one.
+runTest('124_video_title_shown_not_compared') { workDir ->
+    def build = { String name, String title ->
+        def (code, out) = exec([mkvmergeExe, '--output', new File(workDir, name).absolutePath,
+                                '--track-name', "0:${title}", '--audio-tracks', '1', '--no-subtitles',
+                                testMkv.absolutePath])
+        assert (code == 0 || code == 1) : "build failed:\n$out"
+    }
+
+    build('a.mkv', 'Original Japanese')
+    build('b.mkv', 'Original Japanese')
+    def (sameCode, sameOut) = runInspect(workDir)
+    checkEquals(sameCode, 0, 'exit code')
+    check(sameOut.contains('Original Japanese'), "a shared title is shown; got:\n${sameOut}")
+    check(sameOut.contains('consistent'), 'and nothing is flagged')
+
+    // Same files, different titles: the one row now stands for two values.
+    build('b.mkv', 'Episode Two')
+    def (code, out) = runInspect(workDir)
+    checkEquals(code, 0, 'exit code')
+    check(out.contains('(per file)'), "a title that varies says so; got:\n${out}")
+    check(!out.contains('Episode Two'), 'no single file\'s title is presented as the group\'s')
+    check(out.contains('consistent'), 'a differing video title is still never a finding')
+
+    // "-" is the one glyph for absent, everywhere.
+    check(!out.contains('(no name)'), 'nothing invents a name for an unnamed track')
+}
+
+// ─── 118b. a broken episodes.yaml never stops a report either ────────────────
+// The same rule as 118, one file over. episodes.yaml is every bit as
+// hand-editable as config.yaml, and it fails the same ways — plus one of its
+// own, an episode number that is not a number, which throws inside normalizeYaml
+// rather than at parse time and so only stays caught while the transform runs
+// inside the guard.
+//
+// It is deliberately NOT counted into configProblems, which is what the --strict
+// leg pins: --strict says "treat the findings as a failure", and episode
+// metadata produces no findings. It only decorates the source paths --identify
+// resolves, so there is nothing here for a verdict to be about.
+runTest('118b_inspect_survives_broken_episodes_yaml') { workDir ->
+    stageInput(workDir, 'Show - S01E01 - Title.mkv')
+
+    def cases = [
+        'malformed' : "show: Test\nepisodes:\n  - episode: 1\n   name: [\n",
+        'empty'     : "",
+        'not a map' : "- just\n- a list\n",
+        'bad number': "show: Test\nepisodes:\n  - episode: \"one\"\n    name: Pilot\n",
+    ]
+
+    cases.each { label, text ->
+        new File(workDir, 'episodes.yaml').setText(text, 'UTF-8')
+
+        def (code, out) = runInspect(workDir, ['--identify'])
+        checkEquals(code, 0, "${label} episodes.yaml still exits 0")
+        check(out.contains('*** Show - S01E01 - Title.mkv'),
+              "${label} episodes.yaml still prints the track table; got:\n${out}")
+        check(!out.contains('Exception'), "${label} episodes.yaml produces no stack trace; got:\n${out}")
+        check(out.contains('Warning'), "${label} episodes.yaml is reported as a warning; got:\n${out}")
+
+        def (strictCode, strictOut) = runInspect(workDir, ['--strict'])
+        checkEquals(strictCode, 0, "${label} episodes.yaml does not fail --strict")
+        check(!strictOut.contains('config problem'),
+              "${label} episodes.yaml is not counted as a config problem; got:\n${strictOut}")
+    }
+}
+
+// ─── 119b. mux refuses a broken episodes.yaml, cleanly ───────────────────────
+// The mirror of 118b: the same four failures, the opposite policy. A title
+// stamped from metadata that could not be read is the same confidently-wrong
+// output as a mux against a config that was never understood, so it is exit 2 —
+// but an error message, never a stack trace.
+runTest('119b_mux_rejects_broken_episodes_yaml') { workDir ->
+    stageInput(workDir, 'Show - S01E01 - Title.mkv')
+    writeConfig(workDir, cfg(audioTracks: [[id: 1, language: 'ja', title: 'Japanese', default: true]]))
+
+    ["show: Test\nepisodes:\n  - episode: 1\n   name: [\n",
+     "",
+     "- just\n- a list\n",
+     "show: Test\nepisodes:\n  - episode: \"one\"\n    name: Pilot\n"].each { text ->
+        new File(workDir, 'episodes.yaml').setText(text, 'UTF-8')
+
+        def (code, out) = runMkvGroovy(workDir, ['--dry-run'])
+        checkEquals(code, 2, "exits 2 on episode metadata it cannot use; got:\n${out}")
+        check(out.contains('*** Error:'), 'says what is wrong')
+        check(out.contains('episodes.yaml'), 'and names the file it is talking about')
+        check(!out.contains('Exception'), "no stack trace; got:\n${out}")
+        check(!new File(workDir, 'mkv').exists(), 'muxed nothing')
+    }
+}
+
+// ─── 125. two files of one kind from one variant are two slots ───────────────
+// A group shipping both .ass and .srt for E01 and only .ass for E02 is two
+// muxing passes: mkvmerge is handed a different set of files. Keyed on the kind
+// of file alone the two collide in the slot map, the second silently overwrites
+// the first, and the report says one pass while the legend correctly counts
+// three files — the exact wrong answer the externals-as-slots design exists to
+// prevent.
+runTest('125_same_kind_externals_split_groups') { workDir ->
+    ['01', '02'].each { ep ->
+        stageInput(workDir, "Show - S01E${ep} - Title.mkv".toString())
+        stageExternalText(workDir, "Subs/[GroupA]/Show - S01E${ep} - Title.ass".toString())
+    }
+    // Only E01 also gets a .srt, from the same directory and so the same variant.
+    stageExternalText(workDir, 'Subs/[GroupA]/Show - S01E01 - Title.srt')
+
+    def (code, out) = runInspect(workDir)
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+
+    // One variant: same leaf directory, same (empty) suffix. The split is in the
+    // slots, not in the discovery — those are different questions.
+    check(out.contains('1 variant discovered'),
+          "both files belong to one variant; got:\n${out}")
+    check(out.contains('Layout 2'),
+          "but the episode carrying an extra file of the same kind is its own pass; got:\n${out}")
+    check(!out.contains('Layout 3'), 'and there are two passes, not one per file')
+}
+
+// ─── 126. the shared YAML-mapping loader classifies, and only classifies ─────
+// Four call sites — config.yaml and episodes.yaml, in mux and in inspect — share
+// this, and each applies its own policy to the result. So what is pinned here is
+// the classification itself, plus the two options that exist precisely because
+// the callers differ: the charset and the in-guard transform.
+runTest('126_yaml_mapping_loader') { workDir ->
+    def loader = evaluate(new File(repoRoot, 'src/lib/yaml.groovy'))({ String t -> new Yaml().load(t) })
+    def write = { String name, String text ->
+        def f = new File(workDir, name)
+        f.setText(text, 'UTF-8')
+        f
+    }
+
+    def good = loader.loadMapping(write('good.yaml', "a: 1\n"))
+    checkEquals(good.value, [a: 1], 'a mapping comes back as itself')
+    checkEquals(good.problem, null, 'and reports no problem')
+
+    def empty = loader.loadMapping(write('empty.yaml', ''))
+    checkEquals(empty.value, null, 'an empty file has no value')
+    check(empty.problem?.contains('is empty'), "and says so; got: ${empty.problem}")
+
+    def list = loader.loadMapping(write('list.yaml', "- one\n- two\n"))
+    checkEquals(list.value, null, 'a sequence is not a mapping')
+    check(list.problem?.contains('not a mapping'), "and says so; got: ${list.problem}")
+
+    def broken = loader.loadMapping(write('broken.yaml', "a: 1\n  b: [\n"))
+    checkEquals(broken.value, null, 'a syntax error has no value')
+    // The fragment is lowercase and unpunctuated because the caller finishes it:
+    // mux appends "; there is nothing to mux with." and exits, inspect appends
+    // "; continuing without it." and does not.
+    check(broken.problem?.startsWith('could not parse'),
+          "and is a bare fragment for the caller to finish; got: ${broken.problem}")
+    checkEquals(broken.problem.readLines().size(), 1,
+                'first line only - snakeyaml dumps a screenful of context after it')
+
+    // The transform runs INSIDE the guard, which is the only reason normalizeYaml
+    // is safe to pass: `episode: "one"` throws there, not at parse time.
+    def blew = loader.loadMapping(write('t.yaml', "a: 1\n"),
+                                  [transform: { throw new NumberFormatException('boom') }])
+    checkEquals(blew.value, null, 'a transform that throws is a problem, not a stack trace')
+    check(blew.problem?.contains('could not parse'), "and is reported like one; got: ${blew.problem}")
+
+    // charset is a parameter because episodes.yaml is a fixed UTF-8 contract while
+    // config.yaml keeps Groovy's auto-detection. Unifying them would break one.
+    def cyrillic = loader.loadMapping(write('cyr.yaml', "show: Тест\n"), [charset: 'UTF-8'])
+    checkEquals(cyrillic.value?.show, 'Тест', 'an explicit charset reads non-ASCII correctly')
+}
+
+// ─── 127. the check report grays a guessed external language ─────────────────
+// The same de-emphasis --identify already applies, wired through the slot
+// signature so the batch report matches it and the documented palette. A probed
+// language is the real thing and stays default-coloured even when its own folder
+// name would have guessed something else; only an inferred one is grayed. The
+// guessed flag rides alongside SIG_KEYS, never inside it, so it cannot change how
+// files are grouped.
+runTest('127_check_grays_guessed_language') { workDir ->
+    ['01', '02'].each { ep ->
+        stageInput(workDir, "Show - S01E${ep} - Title.mkv".toString())
+        // Probed .mka carrying a real Japanese track, under a folder that would
+        // otherwise guess Russian: the probe wins, so this is never a guess.
+        stageExternalTrack(workDir, "Rus sound/[Real]/Show - S01E${ep} - Title.mka".toString(), 'audio', 1)
+        // Raw .ass, never probed: the only language it can have is the folder's
+        // guess, so it is the one that gets grayed.
+        stageExternalText(workDir, "Rus subs/[Guess]/Show - S01E${ep} - Title.ass".toString())
+    }
+
+    // Both episodes carry both externals, so the batch is one consistent layout
+    // group with no minority file-evidence lists — the only gray in the output is
+    // therefore a guessed language, which is what makes the assertions clean.
+    def (code, out) = runInspect(workDir, ['--color', 'always'])
+    checkEquals(code, 0, "exit code (output was:\n$out\n)")
+    check(out.contains("${esc}[90mrus? ${esc}[0m"),
+          "a guessed external language is grayed in the check table; got:\n${out}")
+    check(!out.contains("${esc}[90mjpn"),
+          "a probed language is never grayed, even under a mis-suggesting folder; got:\n${out}")
+
+    // Plain mode keeps the '?' (it is in the string, not the colour) and emits no
+    // escapes at all — the guess is still marked, just not coloured.
+    def (plainCode, plainOut) = runInspect(workDir, ['--color', 'never'])
+    checkEquals(plainCode, 0, 'exit code (never)')
+    check(plainOut.contains('rus?'), 'the guess is still marked with a ? under --color never')
+    check(!plainOut.contains("${esc}["), 'and nothing is coloured')
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────

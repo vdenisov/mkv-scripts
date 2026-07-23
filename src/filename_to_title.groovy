@@ -9,8 +9,8 @@ import org.apache.commons.io.FilenameUtils
 // No arg parsing here (the script takes no options), so colour is controlled
 // by auto-detection and NO_COLOR only.
 def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
-def ui = evaluate(new File(scriptDir, 'output.groovy'))('auto')
-def findMkvTool = evaluate(new File(scriptDir, 'tools.groovy'))
+def ui = evaluate(new File(scriptDir, 'lib/output.groovy'))('auto')
+def findMkvTool = evaluate(new File(scriptDir, 'lib/tools.groovy'))
 
 def mkvpropeditExe
 try {

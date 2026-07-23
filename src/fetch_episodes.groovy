@@ -52,7 +52,7 @@ import java.time.LocalDate
 // Shared console-output helpers, resolved relative to this script's own
 // location — see output.groovy for why they are loaded explicitly by path.
 def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
-def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)
+def ui = evaluate(new File(scriptDir, 'lib/output.groovy'))(colorMode)
 
 // The current directory takes precedence, falling back to a copy next to this
 // script, so the key does not have to be copied into every media directory. This
