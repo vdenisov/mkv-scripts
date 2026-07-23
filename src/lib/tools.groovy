@@ -1,7 +1,7 @@
 // tools.groovy — shared non-output helpers for the scripts in src/.
 //
 // Loaded the same way as output.groovy: evaluate(new File(scriptDir,
-// 'tools.groovy')) with scriptDir resolved from the calling script's own
+// 'lib/tools.groovy')) with scriptDir resolved from the calling script's own
 // location, never the CWD. See output.groovy for why the file is loaded
 // explicitly instead of relying on Groovy's sibling-class resolution.
 //

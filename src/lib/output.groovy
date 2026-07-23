@@ -1,6 +1,6 @@
 // output.groovy — shared console-output helpers for every script in src/.
 //
-// Loaded at runtime with evaluate(new File(scriptDir, 'output.groovy')), where
+// Loaded at runtime with evaluate(new File(scriptDir, 'lib/output.groovy')), where
 // scriptDir is resolved from the calling script's own location — never from the
 // CWD, since the scripts run from arbitrary media directories. The file is
 // deliberately never referenced as a class: Groovy's implicit sibling-class
@@ -82,6 +82,69 @@
         // caller's job: System.err.println yellow('***          ...').
         warn   : { s -> System.err.println yellow("*** Warning: ${s}") },
 
-        plural : { int n, String noun -> "${n} ${noun}${n == 1 ? '' : 's'}" },
+        // "1 file" / "3 files". Every count printed by these scripts knows its
+        // own number, so there is never a reason to fall back on "file(s)".
+        // Pass an explicit plural for anything that does not simply take an -s:
+        // plural(n, 'discrepancy', 'discrepancies').
+        plural : { int n, String noun, String plural = null ->
+            "${n} ${n == 1 ? noun : (plural ?: noun + 's')}"
+        },
+
+        // The noun alone, for a sentence that has already printed the count or
+        // needs the word in another position ("2 files use a different layout").
+        pluralize: { int n, String noun, String plural = null ->
+            n == 1 ? noun : (plural ?: noun + 's')
+        },
+
+        // A progress meter for the probing passes, which are seconds of silence
+        // on a slow share. Call tick() per item and finish() at the end.
+        //
+        // Two renderings, chosen by the same terminal probe that gates colour.
+        // On a terminal the line is rewritten in place with a bar and a
+        // percentage. Redirected to a file or a pipe it degrades to appended
+        // dots, because '\r' does not erase anything there — every frame would be
+        // retained, smearing "10%^M20%^M30%^M" through the log, and the test
+        // harness captures through a pipe. The bar is ASCII for the same reason
+        // the file lists are: this reaches Windows consoles on legacy codepages.
+        //
+        // Dots are emitted per slice of the total rather than per item, so a
+        // 200-file batch no longer wraps the terminal with 200 of them.
+        // `opts.interactive` overrides the terminal probe. It exists so the tests
+        // can drive both renderings — they run through a pipe, where the probe is
+        // false by definition, and the bar would otherwise ship untested.
+        progress: { String label, int total, Map opts = [:] ->
+            def interactive = opts.containsKey('interactive') ? opts.interactive : onTerminal()
+            def width = 24
+            def count = 0
+            def shown = -1
+            def perDot = Math.max(1, (int) Math.ceil(total / 40.0d))
+
+            if (!interactive) {
+                print label
+                System.out.flush()
+            }
+
+            [tick  : {
+                count++
+                def pct = total > 0 ? Math.min(100, (int) (count * 100L / total)) : 100
+                if (interactive) {
+                    if (pct == shown) return
+                    shown = pct
+                    def filled = (int) (pct * width / 100)
+                    print "\r${label}  [${'#' * filled}${'-' * (width - filled)}] ${pct}%"
+                } else {
+                    if (count % perDot != 0 && count != total) return
+                    print '.'
+                }
+                System.out.flush()
+            },
+             finish: {
+                 // The completed bar stays on screen: it is the record of how long
+                 // the wait was for, and clearing it would leave a gap above the
+                 // report with nothing to explain the pause.
+                 if (interactive && shown < 0) print label
+                 println()
+             }]
+        },
     ]
 }

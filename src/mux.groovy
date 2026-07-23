@@ -20,17 +20,9 @@ import java.nio.file.Paths
                     description = "Path to the config file (default: config.yaml in the current directory)")
 @Field String configPath = null
 
-@CommandLine.Option(names = ["--identify"],
-                    description = "Print a track table for every matching file and exit without muxing")
-@Field boolean identifyOnly = false
-
 @CommandLine.Option(names = ["-n", "--dry-run"],
                     description = "Print the mkvmerge command line for every matching file without executing it")
 @Field boolean dryRun = false
-
-@CommandLine.Option(names = ["--check"],
-                    description = "Compare track structure across all matching files and exit without muxing")
-@Field boolean checkOnly = false
 
 @CommandLine.Option(names = ["--no-check"],
                     description = "Skip the automatic pre-flight consistency check before muxing")
@@ -40,10 +32,6 @@ import java.nio.file.Paths
                     description = "Abort instead of warning when the consistency check finds a discrepancy " +
                                   "affecting a track that config.yaml selects")
 @Field boolean strict = false
-
-@CommandLine.Option(names = ["--check-verbose"],
-                    description = "List every file in the consistency report instead of truncating long lists")
-@Field boolean checkVerbose = false
 
 @CommandLine.Option(names = ["--color"], paramLabel = "WHEN",
                     description = "Colorize output: auto (default, only on a terminal and not under NO_COLOR), " +
@@ -66,7 +54,7 @@ import java.nio.file.Paths
 // script-body statement on purpose: closures below capture `ui` from their
 // enclosing scope, so it has to exist before any of them is defined.
 def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
-def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)
+def ui = evaluate(new File(scriptDir, 'lib/output.groovy'))(colorMode)
 
 // Config lives with the media: config.yaml in the current directory, or an
 // explicit --config path. There is deliberately no fall-back to a config beside
@@ -75,17 +63,26 @@ def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)
 // wrong output (its track selections never match). Copy it next to your media,
 // or point --config at your own.
 //
-// The inspection modes (--identify, --check, --check-verbose) describe the files
-// as they are and do not mux, so they run without a config — useful for checking
-// a season's structure before writing the config against it. Only a run that
-// actually muxes requires one. (--check-verbose implies --check, but the
-// checkOnly reassignment for that happens later, so it is named here directly.)
-def inspecting = identifyOnly || checkOnly || checkVerbose
+// Inspecting files without a config — track tables, the batch structure report —
+// is what mkv-inspect is for; this script only muxes, and muxing always needs a
+// config.
+// The three ways a YAML mapping can be unusable are classified in yaml.groovy,
+// shared with inspect.groovy; what to do about one is this script's own call.
+// Here it is always the same clean exit 2 rather than a stack trace, because
+// muxing against a config that could not be understood is exactly the
+// confidently-wrong output this script refuses to produce.
+def loadYaml = evaluate(new File(scriptDir, 'lib/yaml.groovy'))({ String text -> new Yaml().load(text) })
+
 def configFile = configPath ? new File(configPath) : new File("config.yaml")
 def config = null
 if (configFile.isFile()) {
-    config = new Yaml().load(configFile.text)
-} else if (!inspecting) {
+    def loaded = loadYaml.loadMapping(configFile)
+    if (loaded.problem) {
+        ui.error("${loaded.problem}; there is nothing to mux with.")
+        System.exit(2)
+    }
+    config = loaded.value
+} else {
     if (configPath) {
         ui.error("Config file not found: ${configFile.absolutePath}")
     } else {
@@ -98,12 +95,11 @@ if (configFile.isFile()) {
 
 // Locate an MKVToolNix executable: PATH first, then the Windows default
 // install location. Shared with the other scripts via tools.groovy.
-def findMkvTool = evaluate(new File(scriptDir, 'tools.groovy'))
+def findMkvTool = evaluate(new File(scriptDir, 'lib/tools.groovy'))
 
-// Extract general settings from config. All are null-safe: when inspecting
-// without a config, destinationDir is unused (nothing is muxed), the extension
-// filter falls back to the common video containers so there is still something
-// to inspect, and mkvmergeExe is auto-detected from PATH.
+// Extract general settings from config. allowedExtensions falls back to the
+// common video containers, and mkvmergeExe to PATH auto-detection, so both are
+// optional in the config.
 def DEFAULT_EXTENSIONS = ['mkv', 'mp4', 'm4v', 'avi', 'mov', 'ts', 'm2ts', 'webm', 'mka', 'mks'] as Set
 def destinationDir = config?.general?.destinationDir
 def allowedExtensions = (config?.general?.allowedExtensions as Set) ?: DEFAULT_EXTENSIONS
@@ -126,86 +122,21 @@ def uiLanguage = ["en", "en_US"].find { lang ->
 }
 def priority = "lower"
 
-// One indented file name per line, truncating past `limit`. File names are long
-// and comma-joining several per line runs them together; a plain column is far
-// easier to skim and to count. ASCII only ("..." not "…"), since this output
-// lands on Windows consoles running a legacy codepage.
+// Probing and the whole consistency-check report live in check.groovy, shared
+// with inspect.groovy so the pre-flight run here and the standalone report there
+// can never drift. JSON parsing is injected rather than imported there: the
+// shared helpers carry no imports, so groovy.json stays on this side of the seam.
 //
-// Declared here, before every closure that calls it: a closure resolves a
+// Loaded here, before every closure that uses it: a closure resolves a
 // script-level `def` local through its enclosing scope, so the variable has to
 // exist by the time the calling closure is created, not merely by the time it
 // runs.
-def formatFileList = { List<String> names, String indent, int limit = 8 ->
-    def show = Math.min(limit, names.size())   // limit may be Integer.MAX_VALUE (verbose)
-    def lines = names.take(show).collect { indent + it }
-    if (names.size() > show) lines << "${indent}... and ${names.size() - show} more"
-    lines
-}
+def check = evaluate(new File(scriptDir, 'lib/check.groovy'))(
+    [ui: ui, mkvmergeExe: mkvmergeExe, parseJson: { String text -> new JsonSlurper().parseText(text) }])
 
-// Fields compared per track by the consistency check. This is a blocklist model:
-// everything mkvmerge reports that should be stable across a season is compared,
-// and what legitimately varies per episode is left out. Duration, file size,
-// muxing application and writing library are never read at all. The video
-// track's name is excluded below rather than here, because it routinely carries
-// the episode title and so differs by design.
-//
-// default/forced are included because a flag that flips halfway through a season
-// is exactly the silent wrong-output failure this check exists to catch.
-def SIG_KEYS = ['type', 'codec', 'language', 'name', 'default', 'forced']
-
-// NOTE: the per-track JSON key "properties" must be read with .get('properties').
-// On Groovy 4+ both track.properties and track['properties'] resolve to the bean
-// properties of the map object itself, not the JSON key of that name.
-def trackSignature = { Map track ->
-    def props = track.get('properties') ?: [:]
-    def type = track.type ?: '?'
-    [
-        type    : type,
-        codec   : track.codec ?: '?',
-        language: props.get('language') ?: 'und',
-        // Nulled at construction time so it can never leak into a group key
-        name    : type == 'video' ? null : (props.get('track_name') ?: ''),
-        default : props.get('default_track') ? true : false,
-        forced  : props.get('forced_track') ? true : false
-    ]
-}
-
-// One `mkvmerge -J` per file, parsed once. Both --identify and --check read this
-// same record, so asking for both does not double the number of subprocesses.
-def probeFile = { File file ->
-    def proc = [mkvmergeExe, '-J', file.absolutePath].execute()
-    def json = proc.inputStream.text
-    proc.waitFor()
-
-    if (proc.exitValue() != 0) {
-        return [file: file, ok: false, reason: "mkvmerge exit ${proc.exitValue()}", tracks: [:], chapters: 0]
-    }
-
-    def parsed = new JsonSlurper().parseText(json)
-
-    // mkvmerge -J exits 0 even for a file it cannot read, reporting the failure
-    // in container.recognized/supported instead. Checking only the exit code
-    // would let a corrupt file into the comparison as a file with no tracks,
-    // which reads as "every track is absent here" and poisons the whole report.
-    def container = parsed.container ?: [:]
-    if (!container.recognized) {
-        return [file: file, ok: false, reason: 'not recognised as a media file', tracks: [:], chapters: 0]
-    }
-    if (!container.supported) {
-        return [file: file, ok: false, reason: 'container not supported by mkvmerge', tracks: [:], chapters: 0]
-    }
-
-    def tracks = new LinkedHashMap()
-    (parsed.tracks ?: []).each { track ->
-        def id = track.id as Integer
-        tracks[id] = trackSignature(track) + [id: id]
-    }
-
-    def chapterCount = 0
-    (parsed.chapters ?: []).each { chapterCount += (it.num_entries ?: 0) }
-
-    [file: file, ok: true, raw: parsed, tracks: tracks, chapters: chapterCount]
-}
+def formatFileList = check.formatFileList
+def plural = ui.plural
+def probeFile = check.probeFile
 
 // Probe results, keyed by file. Declared here rather than next to the probing
 // loop far below because the closures in this section capture it by enclosing
@@ -215,17 +146,11 @@ def probedInfos = [:]
 
 // ── Substitution variables ──────────────────────────────────────────────────
 //
-// Config values are templates: "${languageName} ${codec}" rather than a literal
-// "Russian SRT". Variables come in two scopes — file-scope ones describe the
-// episode being muxed and are valid everywhere, track-scope ones describe the
-// track a title belongs to and are only valid in a title. Unknown names are a
-// config error caught up front (see the validation block below), never a
-// literal passed through to mkvmerge.
-def episodesHelper = evaluate(new File(scriptDir, 'episodes.groovy'))
-
-def FILE_VARS = ['fileName', 'extension', 'showName', 'seasonNum',
-                 'episodeNum', 'episodeName', 'seasonName', 'showYear'] as Set
-def TRACK_VARS = ['language', 'languageName', 'languageNative', 'codec'] as Set
+// The engine itself lives in subst.groovy, shared with inspect.groovy. Episode
+// metadata is read here and passed in already parsed: snakeyaml stays in the
+// scripts, the semantics live in the helper — the same seam as episodes.groovy's
+// normalizeYaml.
+def episodesHelper = evaluate(new File(scriptDir, 'lib/episodes.groovy'))
 
 // Episode metadata, read from the media directory only — mux never goes to the
 // network. episodes.yaml carries real episode numbers and the raw spelling of
@@ -236,7 +161,18 @@ def episodeSource = null
 def episodesYaml = new File('episodes.yaml')
 def episodesText = new File('episodes.txt')
 if (episodesYaml.isFile()) {
-    episodeData = episodesHelper.normalizeYaml(new Yaml().load(episodesYaml.getText('UTF-8')) as Map)
+    // Hand-editable, so it fails the same three ways config.yaml does and gets
+    // the same clean exit 2: a title stamped from metadata that could not be read
+    // is the same confidently-wrong output. Explicit UTF-8 because this file is
+    // machine-written and that is a fixed contract; normalizeYaml goes through
+    // the guard because `episode: "one"` throws there rather than at parse time.
+    def loaded = loadYaml.loadMapping(episodesYaml,
+                                      [charset: 'UTF-8', transform: episodesHelper.normalizeYaml])
+    if (loaded.problem) {
+        ui.error("${loaded.problem}; delete it or fix it.")
+        System.exit(2)
+    }
+    episodeData = loaded.value
     episodeSource = 'episodes.yaml'
 } else if (episodesText.isFile()) {
     // Line N is episode N. There is no offset option here — mux is not the
@@ -248,115 +184,12 @@ if (episodesYaml.isFile()) {
     episodeSource = 'episodes.txt'
 }
 
-// Language display names come from the JDK's CLDR data, so no table of our own
-// has to be maintained. Both the two-letter codes config.yaml uses and the
-// three-letter codes Matroska carries resolve to the same locale.
-def localeByCode = [:]
-Locale.getISOLanguages().each { code ->
-    def loc = new Locale(code)
-    localeByCode[code] = loc
-    try {
-        localeByCode[loc.getISO3Language()] = loc
-    } catch (ignored) {
-        // A handful of codes have no three-letter form; the two-letter one stands.
-    }
-}
-// ISO 639-2/B ("bibliographic") codes, which differ from the /T codes the JDK
-// returns. Matroska files in the wild carry these, so they have to resolve too.
-[ger: 'de', fre: 'fr', dut: 'nl', chi: 'zh', cze: 'cs', gre: 'el', per: 'fa',
- rum: 'ro', slo: 'sk', alb: 'sq', arm: 'hy', baq: 'eu', bur: 'my', geo: 'ka',
- ice: 'is', mac: 'mk', mao: 'mi', may: 'ms', tib: 'bo', wel: 'cy'].each { bib, code ->
-    localeByCode[bib] = new Locale(code)
-}
+def substEngine = evaluate(new File(scriptDir, 'lib/subst.groovy'))(
+    [ui: ui, episodes: episodesHelper, episodeData: episodeData])
 
-def localeFor = { String code -> code ? localeByCode[code.toLowerCase()] : null }
-
-def languageNameOf = { String code ->
-    def loc = localeFor(code)
-    if (loc == null) return null
-    def name = loc.getDisplayLanguage(Locale.ENGLISH)
-    // The JDK echoes the code back when it has no display name for it
-    (!name || name.equalsIgnoreCase(code)) ? null : name
-}
-
-def languageNativeOf = { String code ->
-    def loc = localeFor(code)
-    if (loc == null) return null
-    def name = loc.getDisplayLanguage(loc)
-    if (!name || name.equalsIgnoreCase(code)) return null
-    // Many languages spell their own name in lower case ("русский"), which
-    // reads wrong in a track title. Upper-case in that language's own rules.
-    name.substring(0, 1).toUpperCase(loc) + name.substring(1)
-}
-
-// Keyed on codec_id, a Matroska specification identifier, rather than on
-// mkvmerge's `codec` display string: the display string is not stable across
-// mkvmerge versions (v99 reports "AVC/H.264/MPEG-4p10" where older releases
-// report the components in the opposite order), and CI runs both a distro
-// mkvtoolnix and the newest release.
-def CODEC_BY_ID = [
-    'V_MPEG4/ISO/AVC' : 'H.264', 'V_MPEGH/ISO/HEVC': 'H.265', 'V_AV1' : 'AV1',
-    'V_MPEG2'         : 'MPEG-2', 'V_VP9'          : 'VP9',
-    'A_AAC'           : 'AAC',   'A_AC3'           : 'AC-3',  'A_EAC3': 'E-AC-3',
-    'A_DTS'           : 'DTS',   'A_TRUEHD'        : 'TrueHD', 'A_FLAC': 'FLAC',
-    'A_OPUS'          : 'Opus',  'A_MPEG/L3'       : 'MP3',   'A_VORBIS': 'Vorbis',
-    'A_PCM/INT/LIT'   : 'PCM',
-    'S_TEXT/UTF8'     : 'SRT',   'S_TEXT/ASS'      : 'ASS',   'S_TEXT/SSA': 'SSA',
-    'S_TEXT/WEBVTT'   : 'WebVTT', 'S_HDMV/PGS'     : 'PGS',   'S_VOBSUB': 'VobSub',
-]
-// Raw (non-Matroska) companion files carry no codec_id at all — a bare .ass
-// probes with an empty codec_id and only a display string — so that is the
-// second tier. Anything unmapped falls through to mkvmerge's own name, which
-// is already readable.
-def CODEC_BY_DISPLAY = [
-    'SubStationAlpha': 'ASS', 'SubRip/SRT': 'SRT', 'HDMV PGS': 'PGS', 'VobSub': 'VobSub',
-]
-
-def friendlyCodec = { track ->
-    if (track == null) return null
-    def codecId = track.get('properties')?.get('codec_id')
-    def mapped = codecId ? CODEC_BY_ID[codecId.toString()] : null
-    if (mapped) return mapped
-    def display = track.codec?.toString()
-    display ? (CODEC_BY_DISPLAY[display] ?: display) : null
-}
-
-// File-scope variables for one episode, memoized. Sources are tried in order:
-// episodes.yaml (or episodes.txt), then the canonical "Show - SxxEyy - Title"
-// file name. Anything still unresolved is reported per file by the pre-flight
-// below, so a season with one episode missing from the metadata loses that one
-// episode rather than the whole batch.
-def fileVarCache = [:]
-def fileVarsFor = { File file ->
-    def cached = fileVarCache[file]
-    if (cached != null) return cached
-
-    def base = FilenameUtils.getBaseName(file.name)
-    def parsed = episodesHelper.parseSeasonEpisode(base)
-    def canonical = episodesHelper.parseCanonicalName(base)
-
-    // Episode numbers are only meaningful within one season, so metadata for a
-    // different season must not be joined against this file.
-    def seasonMatches = !(episodeData?.season != null && parsed?.season != null &&
-                          episodeData.season != parsed.season)
-    def usable = episodeData != null && seasonMatches
-    def fromData = (usable && parsed?.episode) ? episodeData.byEpisode[parsed.episode] : null
-
-    def vars = [
-        fileName   : base,
-        extension  : FilenameUtils.getExtension(file.name),
-        seasonNum  : parsed?.season ?: (usable ? episodeData.season : null),
-        episodeNum : parsed?.episode,
-        episodeName: fromData ?: canonical?.title,
-        showName   : (usable ? episodeData.show : null) ?: canonical?.showName,
-        seasonName : usable ? episodeData.seasonName : null,
-        showYear   : usable ? episodeData.year : null,
-    ]
-
-    def result = [vars: vars, missing: vars.findAll { k, v -> !v }.keySet()]
-    fileVarCache[file] = result
-    result
-}
+def substitute = substEngine.substitute
+def fileVarsFor = substEngine.fileVarsFor
+def trackVarsFor = substEngine.trackVarsFor
 
 // The probed track behind a config track entry, for ${codec}. Probing is only
 // ever triggered when a template actually uses ${codec}; the record is normally
@@ -381,521 +214,35 @@ def companionTrackFor = { String path ->
     (info?.ok) ? info.raw.tracks.find { (it.id as Integer) == 0 } : null
 }
 
-def trackVarsFor = { track, probed ->
-    def code = track?.language?.toString()
-    [language      : code,
-     languageName  : languageNameOf(code),
-     languageNative: languageNativeOf(code),
-     codec         : friendlyCodec(probed)]
-}
-
-def VAR_PATTERN = /\$\{([A-Za-z][A-Za-z0-9]*)\}/
-// Deliberately looser than VAR_PATTERN, so that a malformed body — ${file name},
-// ${var:modifier} — is caught by validation instead of silently surviving as a
-// literal because it failed to look like a variable.
-def LOOSE_PATTERN = /\$\{[^}]*\}/
-
-def substitute = { String template, Map vars ->
-    template.replaceAll(VAR_PATTERN) { full, name -> vars[name] ?: '' }
-}
-
-// Every templated config value, with the variable scope legal in it. Built once
-// so that validation, the pre-flight and the command line all agree on exactly
-// which fields are templates.
-def templateFields = []
-if (config != null) {
-    def all = FILE_VARS + TRACK_VARS
-    if (config.general?.containsKey('title')) {
-        templateFields << [path: 'general.title', value: config.general.title, allowed: FILE_VARS]
-    }
-    def videoTrack = config.mainSource?.videoTrack
-    if (videoTrack?.containsKey('title')) {
-        templateFields << [path: 'mainSource.videoTrack.title', value: videoTrack.title,
-                           allowed: all, track: videoTrack]
-    }
-    ['audioTracks', 'subtitleTracks'].each { key ->
-        (config.mainSource?.get(key) ?: []).eachWithIndex { track, i ->
-            if (track?.containsKey('title')) {
-                templateFields << [path: "mainSource.${key}[${i}].title", value: track.title,
-                                   allowed: all, track: track]
-            }
-        }
-    }
-    (config.additionalSources ?: []).eachWithIndex { source, i ->
-        if (source?.file) {
-            templateFields << [path: "additionalSources[${i}].file", value: source.file, allowed: FILE_VARS]
-        }
-        (source?.tracks ?: []).eachWithIndex { track, j ->
-            if (track?.containsKey('title')) {
-                templateFields << [path: "additionalSources[${i}].tracks[${j}].title", value: track.title,
-                                   allowed: all, track: track]
-            }
-        }
-    }
-}
-
-// Which variables the config actually uses. Everything derived below is gated
-// on these, so a config with no templates costs nothing at all.
-def usedFileVars = [] as Set
-def usesCodec = false
-
 // Validation, stage one: a name that is not a variable, or not a variable legal
 // in this field, is a config error — fatal, before anything is probed or muxed,
 // in every mode. A typo'd ${epsiodeName} would otherwise be stamped verbatim
-// into the track names of an entire season.
-if (config != null) {
-    def offenses = []
-    def badLanguages = []
+// into the track names of an entire season. What comes back is which variables
+// the config actually uses; everything derived from them is gated on that, so a
+// config with no templates costs nothing at all.
+def templateUsage = substEngine.validateTemplates(substEngine.collectTemplateFields(config as Map))
+if (templateUsage.problems) System.exit(2)
+def usedFileVars = templateUsage.usedFileVars
+def usesCodec = templateUsage.usesCodec
 
-    templateFields.each { field ->
-        def text = field.value?.toString() ?: ''
-        def usesLanguageName = false
+// The consistency check itself lives in check.groovy. Everything config-derived
+// that the report needs — which track IDs are selected, what config.yaml titles
+// them, what counts as blocking — is built here and passed in, so the helper
+// stays free of config knowledge.
+def selection = check.makeSelection(config as Map)
 
-        (text =~ LOOSE_PATTERN).each { occurrence ->
-            def matcher = occurrence =~ /^\$\{([A-Za-z][A-Za-z0-9]*)\}$/
-            def name = matcher ? matcher.group(1) : null
-            if (name == null || !field.allowed.contains(name)) {
-                offenses << [path: field.path, token: occurrence, allowed: field.allowed]
-                return
-            }
-            if (FILE_VARS.contains(name)) usedFileVars << name
-            if (name == 'codec') usesCodec = true
-            if (name == 'languageName' || name == 'languageNative') usesLanguageName = true
-        }
-
-        // A language code that has no display name is equally config-static, so
-        // it belongs in the same fail-fast pass rather than surfacing per file.
-        if (usesLanguageName) {
-            def code = field.track?.language?.toString()
-            if (languageNameOf(code) == null || languageNativeOf(code) == null) {
-                badLanguages << [path: field.path, code: code]
-            }
-        }
-    }
-
-    if (offenses || badLanguages) {
-        ui.error("config.yaml has ${ui.plural(offenses.size() + badLanguages.size(), 'substitution problem')}:")
-        offenses.each {
-            System.err.println "  ${it.path}: ${it.token}"
-            System.err.println "      valid here: ${it.allowed.sort().join(', ')}"
-        }
-        badLanguages.each {
-            System.err.println "  ${it.path}: no language name for '${it.code ?: '(none)'}'"
-        }
-        System.exit(2)
-    }
+// Which files are in a layout group, said as episode ranges where the names
+// allow it. Display only, and composed in episodes.groovy so this report and
+// inspect.groovy's render a group identically — see membershipLabel there.
+// The parameter is `batch`, not `files`: both scripts already have a script-level
+// `files`, and a closure parameter of the same name is a compile error here — the
+// same collision the probedInfos/infos note in CLAUDE.md warns about.
+def membershipFor = { List batch ->
+    episodesHelper.membershipLabel(batch.collect { FilenameUtils.getBaseName(it.name) }, ui.pluralize)
 }
 
-// Print a readable track table for one file, for --identify.
-def identifyFile = { File file, Map info ->
-    ui.header("*** ${file.name}")
-
-    if (info == null || !info.ok) {
-        println "  (mkvmerge could not identify this file: ${info?.reason ?: 'unknown error'})"
-        println()
-        return
-    }
-
-    def tracks = info.raw.tracks
-    if (!tracks) {
-        println "  (no tracks)"
-        println()
-        return
-    }
-
-    println ui.cyan(String.format("  %-4s %-10s %-22s %-5s %-4s %-4s %s",
-                                  'ID', 'TYPE', 'CODEC', 'LANG', 'DEF', 'FOR', 'NAME'))
-
-    tracks.each { track ->
-        def props = track.get('properties') ?: [:]
-        printf("  %-4s %-10s %-22s %-5s %-4s %-4s %s%n",
-               track.id,
-               track.type ?: '?',
-               track.codec ?: '?',
-               props.get('language') ?: '?',
-               props.get('default_track') ? 'yes' : 'no',
-               props.get('forced_track') ? 'yes' : 'no',
-               props.get('track_name') ?: '')
-    }
-
-    // Companion sources declared in the config, resolved for this episode. The
-    // resolved path is printed as well as its tracks: with templated paths, what
-    // a pattern actually expands to per episode is half of what one wants to see
-    // here. Never fatal — --identify describes what is there, so a companion
-    // that is missing is a line in the report, not an error.
-    (config?.additionalSources ?: []).each { source ->
-        def path = substitute(source.file.toString(), fileVarsFor(file).vars)
-        def companion = new File(path)
-        println()
-        println ui.cyan("  + ${path}")
-        if (!companion.isFile()) {
-            println "    (not found)"
-            return
-        }
-        def probed = probeFile(companion)
-        if (!probed.ok) {
-            println "    (mkvmerge could not identify this file: ${probed.reason})"
-            return
-        }
-        (probed.raw.tracks ?: []).each { track ->
-            def props = track.get('properties') ?: [:]
-            printf("    %-4s %-10s %-22s %-5s %-4s %-4s %s%n",
-                   track.id,
-                   track.type ?: '?',
-                   track.codec ?: '?',
-                   // A raw .ass or .srt has no language and no codec_id at all,
-                   // so this cell is routinely empty for companions.
-                   props.get('language') ?: '-',
-                   props.get('default_track') ? 'yes' : 'no',
-                   props.get('forced_track') ? 'yes' : 'no',
-                   props.get('track_name') ?: '')
-        }
-    }
-    println()
-}
-
-// ── Consistency check ───────────────────────────────────────────────────────
-//
-// config.yaml selects tracks by numeric ID, which assumes every episode has the
-// same track layout. When that breaks — a translation added mid-season, an old
-// one dropped, a different release group ordering tracks differently — mkvmerge
-// does not complain. It muxes whatever sits at that ID, and the result is a
-// season where some episodes have the wrong dub labelled as something else.
-
-// Group files by the value they carry at each track ID.
-//
-// Deliberately does NOT anchor on the first file: the reference is the largest
-// population. If a translation was dropped from episode 8 onward, anchoring on
-// file one would report 17 files as deviant against a sample of one. Which group
-// is correct is the user's call, not this script's.
-def groupTracks = { List infos ->
-    def allIds = (infos.collectMany { it.tracks.keySet() } as Set).sort()
-
-    allIds.collect { id ->
-        def byKey = new LinkedHashMap()
-        infos.each { info ->
-            def sig = info.tracks[id]
-            def key = (sig == null) ? null : SIG_KEYS.collect { sig[it] }
-            if (!byKey.containsKey(key)) byKey.put(key, [sig: sig, files: []])
-            byKey.get(key).files << info.file.name
-        }
-
-        def groups = byKey.values().toList().sort { a, b ->
-            (b.files.size() <=> a.files.size()) ?: (a.files[0] <=> b.files[0])
-        }
-        // On an even split nothing is the minority, so nothing gets singled out
-        def maxSize = groups[0].files.size()
-        groups.each { it.minority = it.files.size() < maxSize }
-
-        def present = groups.findAll { it.sig != null }
-        def varying = SIG_KEYS.findAll { k -> present.collect { it.sig[k] }.unique().size() > 1 }
-
-        [id        : id,
-         type      : present ? present[0].sig.type : '?',
-         groups    : groups,
-         varying   : varying,
-         missing   : groups.find { it.sig == null }?.files ?: [],
-         consistent: groups.size() == 1]
-    }
-}
-
-// Two tracks are only genuinely ambiguous when type, language, codec AND name
-// all match — including both being unnamed. AC-3 "English" and DTS "English" are
-// perfectly distinguishable, and so is a track named "Director's Commentary".
-// Flag only the case where ID-based selection cannot be reasoned about at all.
-//
-// Aggregated by (signature, ids) rather than reported per file, so a 24-file
-// batch that all shares an ambiguity prints one note instead of twenty-four.
-def findDuplicates = { List infos ->
-    def acc = new LinkedHashMap()
-    infos.each { info ->
-        info.tracks.values()
-            .findAll { it.type != 'video' }
-            .groupBy { [it.type, it.language, it.codec, it.name] }
-            .findAll { key, group -> group.size() > 1 }
-            .each { key, group ->
-                def ids = group.collect { it.id }.sort()
-                def acckey = [key, ids]
-                if (!acc.containsKey(acckey)) {
-                    acc.put(acckey, [type: key[0], language: key[1], codec: key[2], name: key[3],
-                                     ids: ids, files: []])
-                }
-                acc.get(acckey).files << info.file.name
-            }
-    }
-    acc.values().toList()
-}
-
-// ── Blocking vs informational ───────────────────────────────────────────────
-// A discrepancy only corrupts output when it lands on a track the config picks
-// by ID. If every track of that type is being copied, IDs cannot select the
-// wrong thing, so the difference is informational. buildCommandLine hardcodes
-// 0: for video, hence the fixed video ID below.
-// Empty when inspecting without a config: nothing is "selected", so the check
-// prints structure only and skips the blocking/informational classification.
-def selectedVideoIds = config ? ([0] as Set) : ([] as Set)
-def selectedAudioIds = (config?.mainSource?.audioTracks ?: []).collect { it.id as Integer } as Set
-def selectedSubIds = (config?.mainSource?.subtitleTracks ?: []).collect { it.id as Integer } as Set
-def selectedIds = selectedVideoIds + selectedAudioIds + selectedSubIds
-
-def configTitleFor = { Integer id ->
-    ((config?.mainSource?.audioTracks ?: []) + (config?.mainSource?.subtitleTracks ?: []))
-        .find { (it.id as Integer) == id }?.title
-}
-
-def copiesAllOfType = { String type, List infos ->
-    def selected = (type == 'audio') ? selectedAudioIds
-                 : (type == 'subtitles') ? selectedSubIds
-                 : selectedVideoIds
-    def seen = infos.collectMany { info ->
-        info.tracks.values().findAll { it.type == type }.collect { it.id }
-    } as Set
-    !seen.isEmpty() && selected.containsAll(seen)
-}
-
-def isBlocking = { Integer trackId, String type, List infos ->
-    selectedIds.contains(trackId) && !copiesAllOfType(type, infos)
-}
-
-// ── Report ──────────────────────────────────────────────────────────────────
-// A short type name for a track, for the table and the layout descriptions.
-def shortType = { String type -> type == 'subtitles' ? 'subs' : type }
-
-// A file's track LAYOUT: the type at each ID, ignoring codec/name/flags. Two
-// files share a layout when they have the same track IDs with the same type at
-// each. This is what separates a genuinely different release (tracks in a
-// different order, or one missing) from the same release with a value changed.
-def layoutKey = { Map info ->
-    info.tracks.sort { it.key }.collect { id, sig -> "${id}:${sig.type}" }.join(' ')
-}
-def layoutDesc = { Map info ->
-    info.tracks.sort { it.key }.collect { id, sig -> "${id} ${shortType(sig.type)}" }.join('   ')
-}
-
-// Truncate an over-long track name so it cannot break the table's alignment.
-// ASCII "..." rather than an ellipsis, for the same Windows-console reason.
-def fitName = { String name, int width ->
-    name.length() > width ? name[0..<(width - 3)] + '...' : name
-}
-
-def plural = ui.plural
-
-// The differing-cell highlight in the check tables. Terminal detection and the
-// --color/NO_COLOR gating live in output.groovy, shared with the other scripts.
-def hl = ui.yellow
-
-// A fixed-width table cell, padded *before* any colour is applied so the ANSI
-// escapes never count toward the width and break alignment.
-def cell = { value, int width, boolean diff ->
-    def s = String.format("%-${width}s", value == null ? '' : value.toString())
-    diff ? hl(s) : s
-}
-
-// Print a file list with the "<-" marker on the last named file, since the list
-// sits above the row it describes — the marker adjacent to that row reads more
-// clearly than one at the top, next to the unrelated row above. The rest of the
-// list is a plain hanging indent, so a multi-line list is not mistaken for
-// several groups. The "... and N more" summary (if any) stays below the marker.
-def printMinority = { List<String> names, int limit ->
-    def lines = formatFileList(names, '              ', limit)   // 14-space hanging indent
-    if (!lines) return
-    def markIdx = lines.findLastIndexOf { !it.contains('... and ') }
-    if (markIdx < 0) markIdx = 0
-    // The list is evidence, not primary data: gray, so the table rows stand
-    // out against it. The marker keeps the default foreground — its job is to
-    // stay findable inside the gray block — so this is the one place where a
-    // line holds two colour segments (still whole segments, never mid-word).
-    lines.eachWithIndex { line, i ->
-        if (i == markIdx) {
-            println('           <- ' + ui.gray(line.substring(14)))
-        } else {
-            println ui.gray(line)
-        }
-    }
-}
-
-// Row count is bounded by track count, not file count, so a 200-episode batch
-// prints as compactly as a 3-episode one. All tracks are listed, not only the
-// varying ones: this table doubles as the batch's authoritative track map, which
-// is what you read to check config.yaml's numeric IDs against reality.
-def runConsistencyCheck = { List mediaFiles, Map infos ->
-    def ok = mediaFiles.collect { infos[it] }.findAll { it != null && it.ok }
-    def bad = mediaFiles.collect { infos[it] }.findAll { it != null && !it.ok }
-
-    def header = "*** Pre-flight check: ${ok.size()} file(s)"
-    if (bad) header += " (${bad.size()} could not be identified by mkvmerge and are excluded)"
-    ui.header(header)
-    if (bad) {
-        formatFileList(bad.collect { "${it.file.name} (${it.reason})".toString() }, '      ')
-            .each { println it }
-    }
-    if (!ok) {
-        println()
-        return 0
-    }
-    println()
-
-    def limit = checkVerbose ? Integer.MAX_VALUE : 8
-    def blocking = []
-    def informational = []
-
-    // Split files by track layout — the type at each ID. Files that share a
-    // layout are the same release and can be compared value-by-value; files with
-    // a different layout (a shifted track order, or a missing track) are a
-    // different release and get their own table. Ordered largest group first,
-    // ties broken by name so the output is deterministic.
-    def byLayout = ok.groupBy { layoutKey(it) }
-    def layoutGroups = byLayout.values().toList()
-        .sort { a, b -> (b.size() <=> a.size()) ?: (a[0].file.name <=> b[0].file.name) }
-    def largest = layoutGroups[0]
-    def largestTypeAt = { Integer id -> largest[0].tracks[id]?.type }
-
-    // Size the NAME column to the longest name actually present, so it is not
-    // clipped on wide screens nor padded to a fixed width when everything is
-    // short. Clamped so one pathological title cannot blow the line width.
-    def displayName = { Map sig -> sig.type == 'video' ? '-' : (sig.name ?: '(no name)') }
-    def nameLengths = ok.collectMany { it.tracks.values().collect { displayName(it).length() } }
-    def nameWidth = Math.min(60, Math.max(12, (nameLengths ?: [0]).max()))
-
-    // Print one structural group's table. Within a group every ID has a single
-    // type, so rows differ only in codec/language/name/flags. When an ID's value
-    // varies it is split into a row per distinct value, largest first; the
-    // differing cells are highlighted. In the largest group the minority rows
-    // name their files just above themselves (the majority is the norm, unnamed);
-    // outlier groups already list their files above the table, so they don't
-    // repeat them per row.
-    def printGroupTable = { List group, boolean isLargest ->
-        def tgs = groupTracks(group)
-        println ui.cyan("    ${cell('ID', 4, false)} ${cell('TYPE', 6, false)} ${cell('CODEC', 20, false)} " +
-                        "${cell('LANG', 5, false)} ${cell('DEF', 4, false)} ${cell('FOR', 4, false)} NAME")
-
-        // NAME is the last column, so it is not padded (no trailing whitespace);
-        // it is the only cell that can be highlighted on its own here.
-        def rowFor = { id, Map sig, Set diff ->
-            def nm = sig.type == 'video' ? '-' : fitName(sig.name ?: '(no name)', nameWidth)
-            "    ${cell(id, 4, false)} " +
-            "${cell(shortType(sig.type), 6, diff.contains('type'))} " +
-            "${cell(sig.codec, 20, diff.contains('codec'))} " +
-            "${cell(sig.language, 5, diff.contains('language'))} " +
-            "${cell(sig.default ? 'yes' : 'no', 4, diff.contains('default'))} " +
-            "${cell(sig.forced ? 'yes' : 'no', 4, diff.contains('forced'))} " +
-            "${diff.contains('name') ? hl(nm) : nm}"
-        }
-
-        tgs.each { tg ->
-            if (tg.consistent) {
-                println rowFor(tg.id, tg.groups[0].sig, [] as Set)
-                return
-            }
-            def varying = tg.varying as Set
-            def maxSize = tg.groups[0].files.size()
-            // In the common (largest) group the strict-majority row is the
-            // reference: unhighlighted and unnamed, since listing the norm would
-            // be dozens of files. An outlier group has no reference — every value
-            // is a deviation, so every row names its files.
-            def strictMajority = isLargest && tg.groups.size() > 1 && tg.groups[1].files.size() < maxSize
-            tg.groups.eachWithIndex { g, i ->
-                def isReference = i == 0 && strictMajority
-                if (!isReference) printMinority(g.files, limit)   // files above their row
-                println rowFor(tg.id, g.sig, isReference ? ([] as Set) : varying)
-            }
-        }
-    }
-
-    def multi = layoutGroups.size() > 1
-    layoutGroups.eachWithIndex { group, gi ->
-        def uniform = groupTracks(group).every { it.consistent }
-        if (multi) {
-            def shape = group[0].tracks.sort { it.key }.collect { id, sig -> shortType(sig.type) }.join(', ')
-            ui.header("*** Layout ${gi + 1} (${plural(group.size(), 'file')}): ${shape}")
-            // A uniform outlier group has no per-row split to hang its files on,
-            // so list them together here. The largest group is the norm and is
-            // never enumerated; a non-uniform outlier names its files per row.
-            if (gi > 0 && uniform) printMinority(group.collect { it.file.name }, limit)
-        }
-        printGroupTable(group, gi == 0)
-        println()
-
-        // Classification. Non-largest groups are structural outliers, blocking
-        // when the layout change lands on a selected ID. The largest group is
-        // classified on its per-ID value differences.
-        if (gi > 0) {
-            def affected = selectedIds.findAll { id -> group[0].tracks[id]?.type != largestTypeAt(id) }.sort()
-            def verb = group.size() == 1 ? 'uses' : 'use'
-            if (affected) {
-                blocking << "${plural(group.size(), 'file')} ${verb} a different track layout, at " +
-                            "selected track${affected.size() == 1 ? '' : 's'} ${affected.join(', ')}"
-            } else {
-                informational << "${plural(group.size(), 'file')} ${verb} a different track layout " +
-                                 "(selected tracks unaffected)"
-            }
-        } else {
-            groupTracks(group).findAll { !it.consistent }.each { tg ->
-                def title = configTitleFor(tg.id)
-                def label = "track ${tg.id} (${tg.type}${title ? ", config title \"${title}\"" : ''}) - " +
-                            "${tg.varying.join(', ')} differ${tg.varying.size() == 1 ? 's' : ''} across ${tg.groups.size()} groups"
-                if (isBlocking(tg.id as Integer, tg.type, largest)) blocking << label
-                else informational << label
-            }
-        }
-    }
-
-    // Ambiguous duplicates and chapters are observations across the whole batch,
-    // reported once regardless of layout.
-    def duplicates = findDuplicates(ok)
-    if (duplicates) {
-        ui.header("*** Ambiguous track IDs")
-        duplicates.each { dup ->
-            def name = dup.name ? "\"${dup.name}\"" : 'no name'
-            println "    Tracks ${dup.ids.join(' and ')} are both ${dup.type} / ${dup.language} / " +
-                    "${dup.codec} with ${name}, in ${dup.files.size()} file(s)."
-            println "    ID-based selection cannot distinguish them; check which one config.yaml means."
-            def selected = dup.ids.findAll { isBlocking(it as Integer, dup.type, ok) }
-            def label = "tracks ${dup.ids.join(', ')} are ambiguous" +
-                        (selected ? " and config.yaml selects ${selected.size() > 1 ? 'tracks' : 'track'} ${selected.join(', ')}" : '')
-            if (selected) blocking << label else informational << label
-        }
-        println()
-    }
-
-    def withChapters = ok.findAll { it.chapters > 0 }
-    def withoutChapters = ok.findAll { it.chapters == 0 }
-    if (withChapters && withoutChapters) {
-        ui.header("*** Chapters: present in ${withChapters.size()} file(s), absent in ${withoutChapters.size()}")
-        def minority = withChapters.size() < withoutChapters.size() ? withChapters : withoutChapters
-        printMinority(minority.collect { it.file.name }, limit)
-        informational << "chapters are present in some files and not others"
-        println()
-    }
-
-    // Without a config there is nothing to classify against, so report the count
-    // of differences (already detailed in the tables above) and point at how to
-    // classify them. The per-item labels assume selected tracks, so they are only
-    // printed when a config is present.
-    if (config == null) {
-        def findings = blocking + informational
-        if (findings) {
-            println ui.yellow("*** ${findings.size()} difference(s) across the batch (see the tables above).")
-            println "***   Add a config.yaml, or --config <path>, to classify which affect selected tracks."
-        } else {
-            ui.success("*** Track structure is consistent across all ${ok.size()} file(s).")
-        }
-    } else {
-        if (blocking) {
-            println ui.yellow("*** ${blocking.size()} discrepanc${blocking.size() == 1 ? 'y affects a track' : 'ies affect tracks'} that config.yaml selects:")
-            blocking.each { println "      ${it}" }
-        }
-        if (informational) {
-            println "*** ${informational.size()} informational (does not affect what gets muxed):"
-            informational.each { println "      ${it}" }
-        }
-        if (!blocking && !informational) {
-            ui.success("*** Track structure is consistent across all ${ok.size()} file(s).")
-        }
-    }
-    println()
-
-    blocking.size()
+def runConsistencyCheck = { List batch, Map infos ->
+    check.runConsistencyCheck(batch, infos, selection + [membershipFor: membershipFor])
 }
 
 // The track order the config expresses: video first, then audio tracks and
@@ -936,20 +283,15 @@ def validateTrackOrder = { String order ->
     }
 }
 
-// Resolve once, not per file, so the warnings are printed only once. Only needed
-// (and only possible) when muxing — the inspection modes neither build a command
-// line nor necessarily have a config, and the "derived order" note is just noise
-// for them.
+// Resolve once, not per file, so the warnings are printed only once.
 def effectiveTrackOrder
-if (!inspecting) {
-    if (config.containsKey('trackOrder') && config.trackOrder) {
-        effectiveTrackOrder = config.trackOrder.toString()
-        validateTrackOrder(effectiveTrackOrder)
-    } else {
-        effectiveTrackOrder = deriveTrackOrder()
-        println "*** trackOrder not configured; using derived order: ${effectiveTrackOrder}"
-        println()
-    }
+if (config.containsKey('trackOrder') && config.trackOrder) {
+    effectiveTrackOrder = config.trackOrder.toString()
+    validateTrackOrder(effectiveTrackOrder)
+} else {
+    effectiveTrackOrder = deriveTrackOrder()
+    println "*** trackOrder not configured; using derived order: ${effectiveTrackOrder}"
+    println()
 }
 
 def fileName = null
@@ -1187,7 +529,7 @@ if ((fileMasks || excludeMasks) && !files) {
 // per-file, so it drops the affected episodes and muxes the rest, exactly like
 // the companion check below; a typo, which would affect every file, was already
 // fatal above. --strict turns it into an abort, as it does for the check.
-if (usedFileVars && !identifyOnly) {
+if (usedFileVars) {
     def unresolvedByVar = new LinkedHashMap()
     def blocked = [] as Set
 
@@ -1200,16 +542,17 @@ if (usedFileVars && !identifyOnly) {
 
     if (blocked) {
         if (strict) {
-            System.err.println ui.red("*** Strict mode: aborting (${blocked.size()} file(s) with unresolved " +
-                                      "substitution variables).")
+            System.err.println ui.red("*** Strict mode: aborting (${plural(blocked.size(), 'file')} with " +
+                                      "unresolved substitution variables).")
             System.exit(2)
         }
-        println ui.yellow("*** ${blocked.size()} file(s) will be skipped: substitution variables have no value")
+        println ui.yellow("*** ${plural(blocked.size(), 'file')} will be skipped: " +
+                          "substitution variables have no value")
         if (episodeSource == null) {
             println "      no episodes.yaml or episodes.txt in this directory"
         }
         unresolvedByVar.each { name, names ->
-            println "      \${${name}}  (unresolved for ${names.size()} file(s))"
+            println "      \${${name}}  (unresolved for ${plural(names.size(), 'file')})"
             formatFileList(names, '        ').each { println it }
         }
         println()
@@ -1226,7 +569,7 @@ if (usedFileVars && !identifyOnly) {
 }
 
 def companionSources = config?.additionalSources ?: []
-if (companionSources && !identifyOnly) {
+if (companionSources) {
     def missingBySource = new LinkedHashMap()
     def blocked = [] as Set
 
@@ -1242,9 +585,9 @@ if (companionSources && !identifyOnly) {
          }
 
     if (blocked) {
-        println ui.yellow("*** ${blocked.size()} file(s) will be skipped: companion files are missing")
+        println ui.yellow("*** ${plural(blocked.size(), 'file')} will be skipped: companion files are missing")
         missingBySource.each { pattern, names ->
-            println "      ${pattern}  (missing for ${names.size()} file(s))"
+            println "      ${pattern}  (missing for ${plural(names.size(), 'file')})"
             formatFileList(names, '        ').each { println it }
         }
         println()
@@ -1259,11 +602,6 @@ if (companionSources && !identifyOnly) {
         }
     }
 }
-
-// --check-verbose is a modifier on the report and implies --check: it means
-// "inspect, in detail", not "mux with a verbose pre-flight". Without this a bare
-// `mkv-mux --check-verbose` would print the report and then mux the whole batch.
-checkOnly = checkOnly || checkVerbose
 
 // `mkvmerge -J` over a season takes a couple of seconds; muxing takes minutes
 // per file. Probing first is essentially free, so the check runs by default.
@@ -1286,14 +624,13 @@ if (!mediaFiles) {
     return
 }
 
-def wantCheck = checkOnly || (!identifyOnly && !noCheck)
-if (mediaFiles && (identifyOnly || wantCheck)) {
+def wantCheck = !noCheck
+if (mediaFiles && wantCheck) {
     // Probing runs `mkvmerge -J` per file, which is seconds of silence on a
     // slow share for a full season. Print a live tick so it never looks hung.
-    print "*** Reading ${mediaFiles.size()} file(s)"
-    System.out.flush()
-    mediaFiles.each { probedInfos[it] = probeFile(it); print '.'; System.out.flush() }
-    println()
+    def probeProgress = ui.progress("*** Reading ${plural(mediaFiles.size(), 'file')}", mediaFiles.size())
+    mediaFiles.each { probedInfos[it] = probeFile(it); probeProgress.tick() }
+    probeProgress.finish()
     println()
 }
 
@@ -1303,18 +640,10 @@ if (mediaFiles && wantCheck) {
 }
 
 if (blockingCount > 0 && strict) {
-    System.err.println ui.red("*** Strict mode: aborting (${blockingCount} discrepanc${blockingCount == 1 ? 'y' : 'ies'} " +
+    System.err.println ui.red("*** Strict mode: aborting (${plural(blockingCount, 'discrepancy', 'discrepancies')} " +
                               "affecting selected tracks).")
     System.err.println ui.red("*** Nothing was muxed. Fix config.yaml or the inputs, or drop --strict to continue.")
     System.exit(2)
-}
-
-// --check on its own muxes nothing. When --identify is also present, fall
-// through to the loop below, which prints the per-file tables and then returns
-// before muxing because identifyOnly is set.
-if (checkOnly && !identifyOnly) {
-    ui.success("*** Done")
-    return
 }
 
 Process proc = null
@@ -1327,9 +656,9 @@ addShutdownHook {
 }
 
 // mkvmerge only creates a missing output directory in recent versions (older
-// ones fail to open the output file), so create it here — but not when we are
-// only inspecting, which must leave the filesystem untouched
-if (!identifyOnly && !dryRun) {
+// ones fail to open the output file), so create it here — but not on a dry run,
+// which must leave the filesystem untouched
+if (!dryRun) {
     new File(destinationDir).mkdirs()
 }
 
@@ -1338,11 +667,6 @@ files.forEach { file ->
         extension = FilenameUtils.getExtension(file.getName().toLowerCase())
 
         if (allowedExtensions.contains extension) {
-            if (identifyOnly) {
-                identifyFile(file, probedInfos[file])
-                return
-            }
-
             ui.header("*** Processing ${file.name}")
             println()
 

@@ -17,7 +17,7 @@ import picocli.groovy.PicocliScript2
 // Shared console-output helpers, resolved relative to this script's own
 // location — see output.groovy for why they are loaded explicitly by path.
 def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
-def ui = evaluate(new File(scriptDir, 'output.groovy'))(colorMode)
+def ui = evaluate(new File(scriptDir, 'lib/output.groovy'))(colorMode)
 
 // Collect first, sorted by name, so the batch is processed in a predictable
 // order rather than whatever the filesystem returns.
