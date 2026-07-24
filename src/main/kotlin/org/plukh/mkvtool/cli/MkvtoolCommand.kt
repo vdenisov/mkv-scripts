@@ -5,8 +5,8 @@ import picocli.CommandLine.Command
 import java.util.concurrent.Callable
 
 /**
- * Root command. User-facing subcommands are added as they are built; the only one
- * registered so far is the hidden `native-smoke` build probe. `mixinStandardHelpOptions`
+ * Root command. User-facing subcommands are added as they are built; alongside the hidden
+ * `native-smoke` build probe, `to-utf8` is the first ported leaf command. `mixinStandardHelpOptions`
  * supplies `--help` and `--version`.
  */
 @Command(
@@ -14,7 +14,7 @@ import java.util.concurrent.Callable
     mixinStandardHelpOptions = true,
     versionProvider = MkvtoolVersionProvider::class,
     description = ["MKV muxing toolkit."],
-    subcommands = [NativeSmokeCommand::class],
+    subcommands = [NativeSmokeCommand::class, ToUtf8Command::class],
 )
 class MkvtoolCommand : Callable<Int> {
 

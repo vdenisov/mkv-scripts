@@ -6,8 +6,15 @@ package org.plukh.mkvtool.out
  */
 interface Renderer {
 
-    /** Renders one event to its destination (stdout/stderr, colored per the renderer's policy). */
+    /** Renders one diagnostics event to its destination (stdout/stderr, colored per the renderer's policy). */
     fun render(event: OutputEvent)
+
+    /**
+     * Renders one result — a child as it completes, or the root. Result text is command-specific, so a
+     * text renderer delegates this to an injected [ResultTextRenderer] rather than knowing result types
+     * itself. Results are also returned by the core, so unit tests assert on the model, not on this call.
+     */
+    fun render(result: CommandResult)
 
     /**
      * Starts a progress meter for a run of [total] items, returning a handle to drive it. Progress
@@ -18,6 +25,17 @@ interface Renderer {
      * both renderings are testable through a pipe, where the probe is always false.
      */
     fun progress(label: String, total: Int, interactive: Boolean? = null): ProgressHandle
+}
+
+/**
+ * A command's own result-to-text rendering, injected into [TextRenderer]. Kept separate from
+ * [Renderer] so `out` never names a concrete result type: each command supplies the piece that knows
+ * its own results, and [TextStyle] carries the shared palette/streams so every command's text obeys
+ * one color and routing policy. Composable — a piece may delegate a nested child result to another
+ * `ResultTextRenderer` (e.g. the check report reused by inspect and mux).
+ */
+fun interface ResultTextRenderer {
+    fun render(result: CommandResult, style: TextStyle)
 }
 
 /** Drives a progress meter started by [Renderer.progress]: [tick] once per item, [finish] at the end. */

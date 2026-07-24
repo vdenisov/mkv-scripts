@@ -72,4 +72,24 @@ class TextRendererTest : FunSpec({
         val (out, _) = render(ColorMode.ALWAYS, Header("Layout 1 (3 files)"))
         out shouldContain "Layout 1 (3 files)"
     }
+
+    test("Notice is plain uncolored text on stdout, even under always") {
+        val (out, err) = render(ColorMode.ALWAYS, Notice("*** Dry run: nothing will be written"))
+        out shouldContain "*** Dry run: nothing will be written"
+        out shouldNotContain esc
+        err.shouldBeEmpty()
+    }
+
+    test("Advisory is yellow on stdout with no prefix under always") {
+        val (out, err) = render(ColorMode.ALWAYS, Advisory("*** No files"))
+        out shouldContain "${esc}[33m*** No files${esc}[0m"
+        err.shouldBeEmpty()
+    }
+
+    test("Error hint is a verbatim uncolored continuation line on stderr") {
+        val (out, err) = render(ColorMode.ALWAYS, Error("bad encoding", hint = "      try windows-1251"))
+        err shouldContain "${esc}[31m*** Error: bad encoding${esc}[0m"
+        err shouldContain "\n      try windows-1251"
+        out.shouldBeEmpty()
+    }
 })
