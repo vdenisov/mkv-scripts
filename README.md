@@ -1,6 +1,6 @@
-# MKV Scripts
+# mkvtool
 
-[![CI](https://github.com/vdenisov/mkv-scripts/actions/workflows/ci.yml/badge.svg)](https://github.com/vdenisov/mkv-scripts/actions/workflows/ci.yml)
+[![CI](https://github.com/vdenisov/mkvtool/actions/workflows/ci.yml/badge.svg)](https://github.com/vdenisov/mkvtool/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Groovy](https://img.shields.io/badge/groovy-3%2B-4298b8.svg)](https://groovy-lang.org/)
 
@@ -64,12 +64,12 @@ Add `bin/` to your `PATH` once:
 
 ```powershell
 # Windows (persists for the current user)
-setx PATH "%PATH%;C:\path\to\mkv-scripts\bin"
+setx PATH "%PATH%;C:\path\to\mkvtool\bin"
 ```
 
 ```bash
 # Linux / macOS (add to your shell profile)
-export PATH="$PATH:/path/to/mkv-scripts/bin"
+export PATH="$PATH:/path/to/mkvtool/bin"
 ```
 
 Then, from any directory:
