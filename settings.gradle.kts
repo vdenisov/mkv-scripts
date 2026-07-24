@@ -3,10 +3,12 @@
 pluginManagement {
     val kotlinVersion = providers.gradleProperty("kotlinVersion").get()
     val shadowVersion = providers.gradleProperty("shadowVersion").get()
+    val graalvmNativeVersion = providers.gradleProperty("graalvmNativeVersion").get()
     plugins {
         kotlin("jvm") version kotlinVersion
         kotlin("kapt") version kotlinVersion
         id("com.gradleup.shadow") version shadowVersion
+        id("org.graalvm.buildtools.native") version graalvmNativeVersion
     }
     repositories {
         gradlePluginPortal()

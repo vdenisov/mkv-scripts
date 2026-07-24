@@ -1,18 +1,21 @@
-// mkvtool v2 build. See PORTING-GUIDELINES.md ("Conventions established during the
-// port") and PORTING-TODO.md task 0.1. Versions come from gradle.properties.
+// mkvtool v2 build. Versions come from gradle.properties (single source of truth).
 
 plugins {
     // Versions supplied by pluginManagement in settings.gradle.kts.
     kotlin("jvm")
     // kapt runs picocli-codegen: it is a javac annotation processor, so KSP cannot
     // run it. picocli-codegen generates the GraalVM reflection config under
-    // META-INF/native-image, consumed by the native-image build in task 0.3.
+    // META-INF/native-image, consumed by the native-image build below.
     kotlin("kapt")
     // installDist provides the dev launcher; also names it via applicationName below.
     application
     // Maintained shadow fork (com.gradleup.*); the old johnrengelman fork is dead.
     // Wires shadowJar into `assemble`, so `build` produces the fat jar.
     id("com.gradleup.shadow")
+    // GraalVM native-image. Adds the `nativeCompile` task and consumes the reflection
+    // config kapt/picocli-codegen emits under META-INF/native-image. Applying it costs
+    // nothing on an ordinary JDK; only `nativeCompile` requires a GraalVM JDK.
+    id("org.graalvm.buildtools.native")
 }
 
 group = "org.plukh"
@@ -72,6 +75,32 @@ val generateBuildInfo = tasks.register("generateBuildInfo") {
 // compileKotlin -> generateBuildInfo dependency.
 kotlin.sourceSets.main {
     kotlin.srcDir(generateBuildInfo)
+}
+
+// Native binary. The two buildArgs guard the two silent native-image failure modes;
+// the hidden `native-smoke` command probes both end-to-end in CI, and would fail at
+// runtime if either flag were dropped:
+//   -H:+AddAllCharsets  - keep every JDK charset; without it `to-utf8` loses non-default
+//                         encodings (e.g. windows-1251) and Charset.forName throws.
+//   -H:+IncludeAllLocales - bundle CLDR locale data; without it language display names
+//                           (Русский, 日本語) come back empty.
+graalvmNative {
+    // Our only reachability config comes from picocli-codegen (emitted under
+    // META-INF/native-image). The plugin's third-party GraalVM reachability-metadata
+    // repository is unused here, and its schema demands a newer GraalVM than the last
+    // GraalVM CE for JDK 21 (21.0.2, which CI's graalvm-community/21 also resolves to)
+    // ships - leaving it on fails nativeCompile. Disable it.
+    metadataRepository {
+        enabled.set(false)
+    }
+    binaries {
+        named("main") {
+            imageName.set("mkvtool")
+            mainClass.set(application.mainClass.get())
+            buildArgs.add("-H:+AddAllCharsets")
+            buildArgs.add("-H:+IncludeAllLocales")
+        }
+    }
 }
 
 tasks.test {

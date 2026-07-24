@@ -5,14 +5,16 @@ import picocli.CommandLine.Command
 import java.util.concurrent.Callable
 
 /**
- * Root command. No subcommands are registered yet (they arrive per phase of the
- * port); `mixinStandardHelpOptions` supplies `--help` and `--version`.
+ * Root command. User-facing subcommands are added as they are built; the only one
+ * registered so far is the hidden `native-smoke` build probe. `mixinStandardHelpOptions`
+ * supplies `--help` and `--version`.
  */
 @Command(
     name = "mkvtool",
     mixinStandardHelpOptions = true,
     versionProvider = MkvtoolVersionProvider::class,
     description = ["MKV muxing toolkit."],
+    subcommands = [NativeSmokeCommand::class],
 )
 class MkvtoolCommand : Callable<Int> {
 
