@@ -1,0 +1,146 @@
+name: Native
+
+# The v2 Kotlin app (mkvtool). Kept separate from ci.yml, which stays Groovy-only and
+# untouched during the port. Two jobs with different cadences:
+#   build  - fast Linux JVM build + unit tests, on every push-to-main and PR.
+#   native - the slow 3-OS GraalVM native-image build + smoke, only on merge (push to
+#            main), the weekly schedule, and manual dispatch. Native config rarely
+#            changes and each compile is minutes per OS, so it does not run per PR
+#            commit. Runner minutes are free (public repo), so this is about CI noise,
+#            not cost.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly canary: catches a GraalVM/base-image change that breaks the native build
+    # without any commit here.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Everything except the weekly canary, which only needs the native leg.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    name: Build + unit tests (JDK 21)
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Ordinary JVM build: compile, unit tests, and the shadow jar. No GraalVM and no
+      # MKVToolNix — the unit tier fakes probe data and the native-smoke probe uses
+      # neither mkvmerge nor a native image here.
+      - name: Build and test
+        run: ./gradlew build
+
+  harness-app:
+    # The Groovy acceptance harness (the port's oracle) run against the mkvtool binary
+    # instead of the scripts. Expected mostly RED during the port — no subcommands are
+    # wired up yet — so it is NON-BLOCKING: continue-on-error keeps it off the merge gate,
+    # and it is deliberately not added to branch-protection required checks. It flips to
+    # required once phase 5 (mux) lands and the full harness is green under --target app.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    name: Acceptance harness (--target app)
+    env:
+      GROOVY_VERSION: "5.0.6"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The launcher the harness invokes: build/install/mkvtool/bin/mkvtool.
+      - name: Build installDist launcher
+        run: ./gradlew installDist
+
+      # The harness needs mkvmerge at startup and asserts output via mkvmerge -J.
+      - name: Install MKVToolNix
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mkvtoolnix
+          mkvmerge --version
+
+      - name: Cache Groovy distribution
+        uses: actions/cache@v6
+        with:
+          path: ~/groovy
+          key: groovy-${{ env.GROOVY_VERSION }}
+
+      - name: Install Groovy
+        run: |
+          if [ ! -d "$HOME/groovy/groovy-${{ env.GROOVY_VERSION }}" ]; then
+            curl -fsSL -o /tmp/groovy.zip "https://archive.apache.org/dist/groovy/${{ env.GROOVY_VERSION }}/distribution/apache-groovy-binary-${{ env.GROOVY_VERSION }}.zip"
+            mkdir -p "$HOME/groovy"
+            unzip -q /tmp/groovy.zip -d "$HOME/groovy"
+          fi
+          echo "$HOME/groovy/groovy-${{ env.GROOVY_VERSION }}/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Grapes
+        uses: actions/cache@v6
+        with:
+          path: ~/.groovy/grapes
+          key: grapes-${{ env.GROOVY_VERSION }}-${{ hashFiles('src/**/*.groovy') }}
+          restore-keys: |
+            grapes-${{ env.GROOVY_VERSION }}-
+
+      - name: Run acceptance harness against the app
+        run: groovy src/test/run_tests.groovy --target app
+
+  native:
+    # Merge (push is main-only via the branch filter) + weekly schedule + manual.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+            binary: build/native/nativeCompile/mkvtool
+          - os: windows-latest
+            label: windows-x64
+            binary: build/native/nativeCompile/mkvtool.exe
+          - os: macos-latest
+            label: macos-arm64
+            binary: build/native/nativeCompile/mkvtool
+    runs-on: ${{ matrix.os }}
+    name: Native ${{ matrix.label }}
+    defaults:
+      run:
+        # Git Bash is present on the Windows runner too, so one script runs everywhere.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # GraalVM CE (license-clean for an OSS project); installs native-image. The token
+      # avoids anonymous GitHub download rate limits.
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          distribution: graalvm-community
+          java-version: "21"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build native image
+        run: ./gradlew nativeCompile
+
+      # The probe self-asserts and exits non-zero on any mismatch, so running it IS the
+      # assertion: proves -H:+AddAllCharsets (windows-1251 decode) and -H:+IncludeAllLocales
+      # (CLDR native name) survived into this OS's native binary.
+      - name: Smoke-test native binary
+        run: |
+          "${{ matrix.binary }}" native-smoke

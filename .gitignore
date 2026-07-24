@@ -1,8 +1,14 @@
 # IDE / build artifacts
 .idea/
 *.iml
-out/
+# Root-anchored: an unanchored "out/" also matches the src/.../mkvtool/out/ package dir.
+/out/
 .claude/
+
+# Gradle / Kotlin build (the wrapper itself — gradlew*, gradle/wrapper/ — is tracked)
+build/
+.gradle/
+.kotlin/
 
 # Secrets and personal data
 apikey.txt
@@ -11,8 +17,11 @@ episodes.txt.bak
 episodes.yaml
 http-client.private.env.json
 
-# Scratch planning notes, deliberately untracked
-ROADMAP.md
+# Local docs are working notes — keep only CLAUDE.md and README.md tracked.
+# (docs/reference.md is already tracked, so this does not untrack it.)
+*.md
+!CLAUDE.md
+!README.md
 
 # Test artifacts
 work/
