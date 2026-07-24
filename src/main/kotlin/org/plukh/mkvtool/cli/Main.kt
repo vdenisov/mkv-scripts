@@ -8,5 +8,19 @@ import kotlin.system.exitProcess
  * mainClass in build.gradle.kts.
  */
 fun main(args: Array<String>) {
-    exitProcess(CommandLine(MkvtoolCommand()).execute(*args))
+    exitProcess(mkvtoolCommandLine().execute(*args))
+}
+
+/**
+ * Builds the root [CommandLine] with the per-subcommand parser configuration applied. This is the single
+ * place that config lives, so tests exercise the shipping wiring rather than a replica.
+ *
+ * `propedit` forwards every argument to `mkvpropedit` verbatim; `unmatchedOptionsArePositionalParams`
+ * makes picocli treat option-like tokens (`--edit`, `--set`, `-h`) as positional parameters, so they
+ * reach the command's catch-all `@Parameters` list instead of erroring as unknown options.
+ */
+fun mkvtoolCommandLine(): CommandLine {
+    val cmd = CommandLine(MkvtoolCommand())
+    cmd.subcommands["propedit"]?.isUnmatchedOptionsArePositionalParams = true
+    return cmd
 }

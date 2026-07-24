@@ -21,11 +21,27 @@ data class Header(val text: String) : OutputEvent
 data class Success(val text: String) : OutputEvent
 
 /**
- * An error. Rendered red to **stderr**; the renderer applies the shared `*** Error: ` prefix, so
- * [text] carries the message only. This shadows the star-imported `kotlin.Error` within this package;
- * reference `java.lang.Error` by its full name in the rare case one is needed here.
+ * A plain narration line — a mode banner ("*** Dry run: ..."), a blank separator between blocks.
+ * Rendered UNCOLORED to stdout. Narration only: no result data (a count, an outcome) may be composed
+ * into [text] — that belongs in a result model (see [CommandResult]), never in a diagnostics event.
  */
-data class Error(val text: String) : OutputEvent
+data class Notice(val text: String) : OutputEvent
+
+/**
+ * A non-fatal advisory shown on stdout, e.g. "nothing matched". Rendered yellow with no prefix —
+ * distinct from [Warning], which routes to stderr with a `*** Warning: ` prefix. Narration only, the
+ * same no-result-data rule as [Notice].
+ */
+data class Advisory(val text: String) : OutputEvent
+
+/**
+ * An error. Rendered red to **stderr**; the renderer applies the shared `*** Error: ` prefix, so
+ * [text] carries the message only. [hint] is an optional continuation/remediation line printed
+ * verbatim and UNCOLORED to stderr on the next line (it carries its own indentation). This shadows
+ * the star-imported `kotlin.Error` within this package; reference `java.lang.Error` by its full name
+ * in the rare case one is needed here.
+ */
+data class Error(val text: String, val hint: String? = null) : OutputEvent
 
 /**
  * A warning. Rendered yellow to **stderr**; the renderer applies the shared `*** Warning: ` prefix,
