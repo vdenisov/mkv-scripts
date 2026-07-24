@@ -28,6 +28,14 @@ import java.nio.charset.StandardCharsets
                     description='Path to mkvmerge executable (default: auto-detect from PATH)')
 @Field String mkvmergeExeOverride = null
 
+@CommandLine.Option(names=['--target'], paramLabel='scripts|app',
+                    description='What each case runs against: the Groovy scripts (default) or the mkvtool binary')
+@Field String runTarget = 'scripts'
+
+@CommandLine.Option(names=['--app-bin'], paramLabel='PATH',
+                    description='Override the mkvtool binary used by --target app (default: installDist launcher)')
+@Field String appBinOverride = null
+
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
 def scriptDir = new File(getClass().protectionDomain.codeSource.location.toURI()).parentFile
@@ -47,6 +55,16 @@ def groovyExe = new File(System.getProperty('groovy.home', ''), groovyBin).with 
     exists() ? absolutePath : 'groovy'
 }
 
+// --target app runs the mkvtool binary instead of the Groovy scripts. Default is the
+// installDist launcher; --app-bin / MKVTOOL_APP_BIN overrides it (e.g. the native binary).
+def appBin = {
+    def override = appBinOverride ?: System.getenv('MKVTOOL_APP_BIN')
+    if (override) return new File(override)
+    def launcher = isWindows ? 'build/install/mkvtool/bin/mkvtool.bat'
+                             : 'build/install/mkvtool/bin/mkvtool'
+    new File(repoRoot, launcher)
+}()
+
 // Shared with the scripts under test; see src/tools.groovy.
 def findMkvTool = evaluate(new File(repoRoot, 'src/lib/tools.groovy'))
 
@@ -60,6 +78,12 @@ try {
 
 assert testMkv.exists()   : "test.mkv not found at $testMkv"
 assert mkvgroovy.exists() : "mux.groovy not found at $mkvgroovy"
+
+// A missing binary under --target app is a setup error, not a per-case skip: fail loudly
+// and point at the build step instead of silently passing.
+if (runTarget == 'app') {
+    assert appBin.exists() : "mkvtool binary not found at $appBin — run './gradlew installDist' first (or pass --app-bin)"
+}
 
 // ─── Helpers (closures so they capture script-scope variables) ───────────────
 
@@ -242,9 +266,21 @@ def stageTree = { File workDir ->
 /** Run any script from the repo's src/ in workDir; return [exitCode, output].
  *  The output is also kept for diagnostics if the test fails. */
 def runScript = { String scriptName, File workDir, List extraArgs = [], Map env = [:] ->
-    def script = new File(repoRoot, "src/${scriptName}")
-    assert script.exists() : "script not found at $script"
-    def result = exec([groovyExe, script.absolutePath] + extraArgs, workDir, env)
+    List cmd
+    if (runTarget == 'app') {
+        // scriptName carries the .groovy suffix; map it to the subcommand (strip suffix,
+        // underscores to hyphens) — the inverse of the bin/ wrapper rule.
+        def subcmd = scriptName.replaceAll(/\.groovy$/, '').replace('_', '-')
+        // ProcessBuilder cannot launch a .bat directly, so route it through cmd /c;
+        // a native .exe (via --app-bin) is launched directly.
+        def prefix = appBin.name.toLowerCase().endsWith('.bat') ? ['cmd', '/c'] : []
+        cmd = prefix + [appBin.absolutePath, subcmd] + extraArgs
+    } else {
+        def script = new File(repoRoot, "src/${scriptName}")
+        assert script.exists() : "script not found at $script"
+        cmd = [groovyExe, script.absolutePath] + extraArgs
+    }
+    def result = exec(cmd, workDir, env)
     lastMkvOutput = result[1]
     result
 }
@@ -290,6 +326,13 @@ def check = { boolean cond, String msg ->
 
 def checkEquals = { actual, expected, String label ->
     if (actual != expected) throw new AssertionError("$label: expected <$expected> but got <$actual>")
+}
+
+/** Skip a case under --target app (it tests script-only mechanics). Returns true when
+ *  skipped so the caller can `return`; prints a note like the other skip guards. */
+def skipUnderApp = { String reason ->
+    if (runTarget == 'app') { println "  (skipped under --target app: $reason)"; return true }
+    false
 }
 
 /** Run a named test case; handle pass/fail bookkeeping. */
@@ -811,6 +854,7 @@ runTest('24_realistic_season_episode') { workDir ->
 // ─── 25. bin/ wrappers exist and point at real scripts ───────────────────────
 // 18 hand-written files; this catches typos for the price of a directory listing.
 runTest('25_wrappers_exist_and_resolve') { workDir ->
+    if (skipUnderApp('tests the Groovy bin/ wrappers')) return
     def wrappers = [
         'mkv-mux'                : 'mux.groovy',
         'mkv-inspect'            : 'inspect.groovy',
@@ -844,6 +888,7 @@ runTest('25_wrappers_exist_and_resolve') { workDir ->
 // should start up, find nothing to do, and exit cleanly. Deliberately avoids
 // any CLI flags so this test does not depend on later features.
 runTest('26_wrapper_smoke') { workDir ->
+    if (skipUnderApp('tests the Groovy bin/ wrappers')) return
     // The wrappers hardcode a bare 'groovy'; the harness may be using groovy.home.
     // On Windows 'groovy' is a .bat, which ProcessBuilder cannot launch directly —
     // probe through cmd, the same way the wrapper itself is invoked below.
