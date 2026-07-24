@@ -6,8 +6,9 @@ import java.util.concurrent.Callable
 
 /**
  * Root command. User-facing subcommands are added as they are built; alongside the hidden
- * `native-smoke` build probe, `to-utf8`, `fix-srt`, `propedit`, and `find-unused-fonts` are the ported
- * leaf commands. `mixinStandardHelpOptions` supplies `--help` and `--version`.
+ * `native-smoke` build probe, `to-utf8`, `fix-srt`, `propedit`, `filename-to-title`, and
+ * `find-unused-fonts` are the ported leaf commands. `mixinStandardHelpOptions` supplies `--help` and
+ * `--version`.
  */
 @Command(
     name = "mkvtool",
@@ -19,6 +20,7 @@ import java.util.concurrent.Callable
         ToUtf8Command::class,
         FixSrtCommand::class,
         PropeditCommand::class,
+        FilenameToTitleCommand::class,
         FindUnusedFontsCommand::class,
     ],
 )
